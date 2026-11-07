@@ -1,0 +1,29 @@
+{
+  "format": 1,
+  "task_id": "TASK-ID",
+  "run_id": "UUID",
+  "parent_run_id": null,
+  "attempt": 1,
+  "previous_attempt": null,
+  "status": "blocked",
+  "summary": "Replace with actual outcome and explanation.",
+  "candidate": {
+    "base": null,
+    "head": null,
+    "branch": null,
+    "worktree": null,
+    "host": null
+  },
+  "configuration_ref": null,
+  "reviews": [],
+  "qa": [],
+  "artifacts": [],
+  "collaboration": {
+    "pr": null,
+    "issue": null,
+    "external_task": null,
+    "diff": null
+  },
+  "blockers": [],
+  "proposed_next_steps": []
+}

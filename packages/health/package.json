@@ -1,0 +1,24 @@
+{
+  "name": "pi-harness-health",
+  "version": "0.1.3",
+  "private": true,
+  "type": "module",
+  "description": "Session-scoped Pi harness health monitoring and bounded recovery",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "smol-toml": "1.8.0",
+    "zod": "4.6.5"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

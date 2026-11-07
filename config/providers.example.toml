@@ -1,0 +1,12 @@
+# Merge into project/user config only after native Pi exposes the selected model.
+# This is an opt-in example, not a new provider or an authentication file.
+[models.fast_artifacts]
+model = "provider/model"
+
+[profiles.fast_artifacts.agents.log_analyst]
+model = "alias:fast_artifacts"
+
+[profiles.fast_artifacts.agents.screenshot_reviewer]
+model = "alias:fast_artifacts"
+[profiles.fast_artifacts.agents.screenshot_reviewer.requirements]
+input = ["image"]

@@ -1,0 +1,46 @@
+{
+  "src/slash/delegation-request.js": {
+    "original": "c92cd59b88cd134e90a39a0a95bc0f9d0901a06c93bc115f5022ca53e820a96e",
+    "patched": "c317c21d31c3b18d2254818ee71ce15dced75ae2f84b0693b56912c57ed83f81",
+    "edits": [
+      [
+        "    \"intercomBridge\",",
+        "    \"intercomBridge\",\n    \"awaitSupervisor\","
+      ],
+      [
+        "    let intercomBridge;",
+        "    if (value.awaitSupervisor !== undefined && typeof value.awaitSupervisor !== \"boolean\") {\n        return { ok: false, ...identity, error: \"awaitSupervisor must be a boolean.\" };\n    }\n    let intercomBridge;"
+      ]
+    ]
+  },
+  "src/slash/delegation-adapters.js": {
+    "original": "e90dc766c3382caa975b24bc2522d8ccfdcabcaf74334cd6fcf47ef36c70e1b9",
+    "patched": "0867e0ca53141f57e4060bd1f798561134afe899d262a53757a5f2b75a264724",
+    "edits": [
+      [
+        "        delegatedThinkingOverride: request.thinking,",
+        "        ...(request.awaitSupervisor === true ? { workflowAwaitDetached: true, retainOriginCancellation: true } : {}),\n        delegatedThinkingOverride: request.thinking,"
+      ]
+    ]
+  },
+  "src/runs/foreground/subagent-executor.js": {
+    "original": "798bc064b3e93c6054f2a5b24b5258662fd2481d1a5bd62ce3c8fac492ae8baf",
+    "patched": "3445255052bd260b96afa0adfd349acbd93c58abc274168a5a40b4ad5ff27199",
+    "edits": [
+      [
+        "            onDetachedExit: async (result) => {",
+        "            retainOriginCancellation: params.retainOriginCancellation === true,\n            onDetachedExit: async (result) => {"
+      ]
+    ]
+  },
+  "src/runs/foreground/execution.js": {
+    "original": "c3a9b57532cf25da486ef0af8fea140ee381568daded9ae1128920e93b0717f3",
+    "patched": "76eba33af31762630d3790164873fb964275f27aee0d0ebf851e72db1ea0f7cb",
+    "edits": [
+      [
+        "        if (!detachedReason)\n            originController.abort(originSignal?.reason);",
+        "        if (!detachedReason || options.retainOriginCancellation === true)\n            originController.abort(originSignal?.reason);"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+format = 1
+name = "native-smoke"
+repetitions = 2
+
+[tasks.marker]
+kind = "delegate"
+type = "summarizer"
+task = "Reply exactly EXPERIMENT-OK. Do not use tools."
+[tasks.marker.criterion]
+kind = "exact_text"
+expected = "EXPERIMENT-OK"
+
+[variants.inherited]

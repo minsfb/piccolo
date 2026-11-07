@@ -1,0 +1,41 @@
+# Dependencies and build output
+node_modules
+dist/
+build/
+coverage/
+*.tsbuildinfo
+__pycache__/
+*.pyc
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+auth.json
+models.json
+*.pem
+*.key
+*.local.json
+*.local.toml
+
+# Agent state, local project settings, and research captures
+.pi/
+.research/
+.worktrees/
+.cache/
+sessions/
+transcripts/
+artifacts/
+browser-profiles/
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Editor and OS state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

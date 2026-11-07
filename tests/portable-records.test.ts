@@ -1,0 +1,51 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { git } from "../src/workflow.ts";
+import { exportWorkflow, auditStagedRecords } from "../src/portable-records.ts";
+test("portable summary omits private/raw fields, preserves categorical evidence, and audits the index", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "piccolo-portable-"));
+  try {
+    git(root, "init", "-b", "main");git(root,"config","user.name","Fixture");git(root,"config","user.email","fixture@example.invalid");
+    const id = "c565b1ae-a5f2-43f1-860f-19cbf0a2a2a5", sha = "a".repeat(40), secret = "PRIVATE-CANARY";
+    const record = path.join(root, ".piccolo/workflows", id); fs.mkdirSync(record, { recursive: true });
+    fs.writeFileSync(path.join(record,"launch.json"), JSON.stringify({id,task:secret,root:"/Users/private/project",resolved:{digest:"a".repeat(64),config:{token:secret}}}));
+    fs.writeFileSync(path.join(record,"outcome.json"), JSON.stringify({id,candidate:sha,base:sha,status:"partial",summary:secret,validation:{status:"incomplete",required:["private-check"],missing:["private-check"]}}));
+    fs.writeFileSync(path.join(record,"0001.json"),JSON.stringify({stage:"qa",candidate:sha,report:{status:"blocked",summary:secret,evidence:[secret]}}));
+    const exported = exportWorkflow(root,id);
+    const text = fs.readFileSync(path.join(root,exported.file),"utf8");
+    assert.ok(!text.includes(secret));assert.ok(!text.includes("/Users/"));assert.ok(!text.includes("private-check"));
+    assert.equal(exported.summary.disposition,"partial");assert.equal(exported.summary.stages[0].reported_status,"blocked");assert.equal(exported.summary.validation.status,"incomplete");
+    assert.throws(()=>exportWorkflow(root,id),/EEXIST/);
+    git(root,"add",exported.file);assert.equal(auditStagedRecords(root).status,"pass");
+    // The working-tree file differs, but publication audit must inspect staged bytes.
+    const target=path.join(root,".piccolo/task.md");fs.writeFileSync(target,"/Users/private/raw\n");git(root,"add",".piccolo/task.md");fs.writeFileSync(target,"now harmless\n");
+    assert.ok(auditStagedRecords(root).findings.some(f=>f.code==="machine_absolute_path"));
+    const policy = path.join(root,"local-policy.json");
+    fs.writeFileSync(policy, JSON.stringify({format:1,restricted_literals:["now harmless"]}));
+    git(root,"add",".piccolo/task.md");
+    const policyResult = auditStagedRecords(root,policy);
+    assert.ok(policyResult.findings.some(f=>f.code==="project_policy_literal"));
+    assert.ok(!JSON.stringify(policyResult).includes("now harmless"));
+    const privateName = ".piccolo/now harmless.md";
+    fs.writeFileSync(path.join(root, privateName), "document"); git(root,"add",privateName);
+    const hidden = auditStagedRecords(root,policy);
+    assert.ok(!JSON.stringify(hidden).includes("now harmless"));
+    fs.writeFileSync(policy,'{"restricted_literals":["PRIVATE-PARSE-CANARY", BROKEN]}');
+    assert.throws(()=>auditStagedRecords(root,policy),error=>!String(error).includes("PRIVATE-PARSE-CANARY") && /Invalid records audit policy/.test(String(error)));
+    git(root,"commit","-m","Baseline summary");
+    fs.unlinkSync(target);fs.symlinkSync("/Users/private/raw", target);git(root,"add",".piccolo/task.md");
+    assert.ok(auditStagedRecords(root).findings.some(f=>f.code==="machine_absolute_path"));
+    git(root,"add",`.piccolo/workflows/${id}/launch.json`);
+    const result=auditStagedRecords(root);assert.equal(result.status,"needs_review");
+    assert.ok(result.findings.some(f=>f.code==="raw_execution_record_requires_review"));assert.ok(!JSON.stringify(result).includes(secret));
+    git(root,"commit","-m","Retain raw fixture");
+    git(root,"checkout","-b","left");fs.writeFileSync(path.join(root,privateName),"left");git(root,"add",privateName);git(root,"commit","-m","Left");
+    git(root,"checkout","main");fs.writeFileSync(path.join(root,privateName),"right");git(root,"add",privateName);git(root,"commit","-m","Right");
+    assert.throws(()=>git(root,"merge","left"));
+    fs.writeFileSync(policy,JSON.stringify({format:1,restricted_literals:["now harmless"]}));
+    assert.throws(()=>auditStagedRecords(root,policy),error=>/Cannot inspect staged execution records/.test(String(error)) && !String(error).includes("now harmless"));
+  } finally {fs.rmSync(root,{recursive:true});}
+});
