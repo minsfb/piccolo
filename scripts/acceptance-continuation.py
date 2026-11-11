@@ -32,7 +32,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--nested-checks", action="store_true", help="Require nested-cwd checks, retaining an intentional failure and a later pass")
-    parser.add_argument("--compatibility", choices=["managed-0.85.1", "managed-0.86.1", "managed-1.3.0"], default="managed-1.3.0")
+    parser.add_argument("--compatibility", choices=["managed", "native-v1", "managed-0.85.1", "managed-0.86.1", "managed-1.3.0", "managed-1.4.0"], default="managed")
     args = parser.parse_args()
     root = args.root.resolve()
     manifest = json.loads((root / "fixture.json").read_text())

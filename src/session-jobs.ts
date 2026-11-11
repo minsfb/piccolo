@@ -187,6 +187,7 @@ export class SessionJobs {
   status(id: string) {
     const job = this.get(id);
     return { id, kind: job.kind, state: job.state, stopping: active(job) && job.controller.signal.aborted, lifetime: "session", host: os.hostname(), updated_at: job.updatedAt,
+      has_result: job.result !== undefined,
       record: path.relative(this.root, job.directory), error_truncated: (job.error?.length ?? 0) > 1000, outcome_revision: this.revision(job),
       parent_review: job.review ?? { disposition: active(job) ? "not_ready" : "pending" }, error: job.error?.slice(0, 1000),
       children: [...job.children.values()].slice(0, 8).map(({ control, target, coordinator }) => ({ id: control.id, target: target.slice(0, 240), target_truncated: target.length > 240, coordinator, attached: control.attached, phase: control.phase ?? "starting" })), children_total: job.children.size,

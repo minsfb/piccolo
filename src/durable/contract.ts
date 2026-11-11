@@ -88,13 +88,13 @@ export type WorkerSubmission = z.infer<typeof submissionSchema>;
 export type Workspace = z.infer<typeof workspaceSchema>;
 export function fingerprint(input: WorkerSubmission): string { return digest(input); }
 export const workerRequestSchema = z.discriminatedUnion("operation", [
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("assess"), requestId: z.string().uuid(), assessment: assessmentSchema }),
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("export_schedule"), requestId: z.string().uuid() }),
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("submit"), submission: submissionSchema }),
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("inspect"), requestId: z.string().uuid() }),
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("message"), requestId: z.string().uuid(), messageId: z.string().uuid(), text: text, target: z.string().optional() }),
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("watch"), requestId: z.string().uuid(), revision: z.string(), timeoutMs: z.number().int().min(0).max(30000) }),
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("abort"), requestId: z.string().uuid() }),
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("info") }),
-  z.strictObject({ workspace: workspaceSchema.optional(), operation: z.literal("close"), owner: z.string().min(1), mode: z.enum(["suspend", "cancel-session"]) }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("assess"), requestId: z.string().uuid(), assessment: assessmentSchema }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("export_schedule"), requestId: z.string().uuid() }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("submit"), submission: submissionSchema }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("inspect"), requestId: z.string().uuid() }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("message"), requestId: z.string().uuid(), messageId: z.string().uuid(), text: text, target: z.string().optional() }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("watch"), requestId: z.string().uuid(), revision: z.string(), timeoutMs: z.number().int().min(0).max(30000) }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("abort"), requestId: z.string().uuid() }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("info") }),
+  z.strictObject({ workspace: workspaceSchema, operation: z.literal("close"), owner: z.string().min(1), mode: z.enum(["suspend", "cancel-session"]) }),
 ]);

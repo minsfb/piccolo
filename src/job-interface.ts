@@ -18,6 +18,7 @@ import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import { WorkerWaitCancelled } from "./durable/wait.ts";
 import { setRecoveryNotice } from "./durable/recovery-notices.ts";
 import { subagentsPublicExport } from "./runtime.ts";
+import { readAdmissions } from "./durable/admissions.ts";
 
 type Prepared = { target?: RemoteWorker; snapshot: unknown; settings: Config["background"]; execute: (execution: JobExecution) => Promise<unknown> };
 const response = (value: unknown) => {
@@ -60,6 +61,7 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
     if (creating) await creating;
     if (owner instanceof DurableJobs && owner.worker.cancellationOnly && !cancellationOnly) {
       const control = owner;
+      if (control.worker.savedCancellationError) throw new Error(`Saved cancellation failed: ${control.worker.savedCancellationError}. Repair the saved inputs/storage and retry cancel_saved before starting or restoring work.`);
       if (await control.worker.cancellationInProgress()) throw new Error("Saved cancellation is still in progress. Use piccolo_jobs wait or status before starting or restoring work.");
       creating = (async () => { await control.close("suspend"); unregister?.(); unregister = undefined;
         if (owner === control) { owner = undefined; workspace = undefined; } })();
@@ -71,7 +73,7 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
     if (owner && owner.root !== projectRoot(ctx.cwd)) throw new Error("Start a new session before submitting jobs from another project root");
     if (owner && (owner instanceof DurableJobs) !== ((settings?.executor ?? "durable") === "durable")) throw new Error("Start a new session before changing the worker executor");
     if (!owner) {
-      if (!restore && (settings?.executor ?? "durable") === "durable" && (recovery?.jobs.some(job => !job.terminal) || recovery?.error)) throw new Error("Saved Jobs are suspended. Inspect piccolo_jobs recovery and use resume before submitting new work.");
+      if (!restore && (settings?.executor ?? "durable") === "durable" && (recovery?.jobs.some(job => !job.terminal) || recovery?.error)) throw new Error(recovery?.error ? `Cannot verify saved Durable work: ${recovery.error}. Inspect piccolo_jobs recovery and retry discovery after repairing storage.` : "Saved Jobs are suspended. Inspect piccolo_jobs recovery and use resume before submitting new work.");
       const identity = ctx.sessionManager.getSessionId();
       const callbacks = {
         pool, capacity: pool?.capacity, maxJobs: settings?.max_jobs_per_session, shutdownMs: settings?.shutdown_timeout_ms, changed: redraw,
@@ -104,7 +106,7 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
       };
       creating = (async () => {
         recovery ??= await discoverJobs(projectRoot(ctx.cwd), identity, ctx, settingsFor(ctx));
-        if (!restore && (settings?.executor ?? "durable") === "durable" && (recovery.jobs.some(job => !job.terminal) || recovery.error)) throw new Error("Saved Jobs are suspended. Inspect piccolo_jobs recovery and choose resume first.");
+        if (!restore && (settings?.executor ?? "durable") === "durable" && (recovery.jobs.some(job => !job.terminal) || recovery.error)) throw new Error(recovery.error ? `Cannot verify saved Durable work: ${recovery.error}. Inspect piccolo_jobs recovery and retry discovery after repairing storage.` : "Saved Jobs are suspended. Inspect piccolo_jobs recovery and choose resume first.");
         if ((settings?.executor ?? "durable") === "durable") {
           const local = await localJobs(projectRoot(ctx.cwd), ctx, { ...callbacks, resume: false, dispatchOnly, cancellationOnly, workerPolicy: integration?.worker_policy, managedPolicy: integration?.require_worker_policy === true, nativeSettings: { ...pi.getSettings() } });
           owner = local.jobs; workspace = local.workspace;
@@ -130,11 +132,16 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
     if (!(jobs instanceof DurableJobs)) throw new Error("Saved Jobs require Durable execution");
     await jobs.worker.resumeSaved(); recovery = undefined; suspendOnShutdown = false; await jobs.refresh(); return jobs.list(0, 1000);
   };
-  const cancelSaved = async (ctx: ExtensionContext) => {
+  const cancelSaved = async (ctx: ExtensionContext, includeIndependent = false) => {
+    if (owner instanceof DurableJobs && !owner.worker.savedSuspended && !owner.worker.cancellationOnly)
+      throw new Error("cancel_saved is limited to a suspended saved generation. Use stop for an active Job.");
     const config = settingsFor(ctx);
     const jobs = await manager(ctx as ExtensionToolContext, { ...config.background, executor: "durable" }, config.pool, true,
       !!recovery?.jobs.length && recovery.jobs.every(job => !!job.remote), config.integration, true);
     if (!(jobs instanceof DurableJobs)) throw new Error("Saved cancellation requires Durable Jobs");
+    const admissions = Object.values(await readAdmissions(jobs.worker.harness, BACKGROUND_CONTEXT));
+    if (!includeIndependent && admissions.some(admission => admission.input.owner === jobs.session && admission.input.lifetime === "independent"))
+      throw new Error("Saved generation includes attached independent Jobs. Set include_independent=true to cancel this whole saved generation, or keep it suspended and stop a detached Job on its original worker.");
     const wait = withCancel(BACKGROUND_CONTEXT), timer = setTimeout(() => wait.cancel(), 1000);
     try { await jobs.worker.cancelSaved(jobs.session, wait.context); }
     catch (error) { if (!(error instanceof WorkerWaitCancelled)) throw error; }
@@ -149,7 +156,7 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
       return { id: job.id, kind: job.kind, owner: safe(job.owner, 200), lifetime: job.lifetime, host: safe(job.host, 200),
         state: safe(job.state, 200), terminal: job.terminal, availability: job.availability, parentReview: job.parentReview,
         outcomeRevision: job.outcomeRevision, dismissed: job.dismissed, unresolvedRemote: job.unresolvedRemote, hostName: safe(job.hostName, 200),
-        reason: safe(job.reason), attention: job.attention?.slice(0, 4).map(item => ({ id: safe(item.id, 200), stage: safe(item.stage, 200), question: safe(item.question) })), has_result: job.result !== undefined };
+        reason: safe(job.reason), attention: job.attention?.slice(0, 4).map(item => ({ id: safe(item.id, 200), stage: safe(item.stage, 200), question: safe(item.question) })), has_result: job.hasResult ?? (job.result !== undefined) };
     };
     const page: Array<{ scope: string; job: ReturnType<typeof summary> }> = [];
     for (const entry of entries.slice(offset, offset + limit)) {
@@ -159,17 +166,18 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
     }
     return { session: inventory.session, jobs: page.filter(item => item.scope === "session").map(item => item.job),
       independent: page.filter(item => item.scope === "independent").map(item => item.job), total: entries.length,
+      session_total: inventory.jobs.length, independent_total: inventory.independent.length,
       next_offset: offset + page.length < entries.length ? offset + page.length : null, error: inventory.error,
       note: "This is recovery status. Resume or attach explicitly to inspect full outcomes; terminal work is not rerun." };
   };
   const changeNotice = async (id: string, dismissed: boolean, ctx: ExtensionContext) => {
     const root = projectRoot(ctx.cwd), session = ctx.sessionManager.getSessionId();
     if (owner && (owner.root !== root || owner.session !== session)) throw new Error("Use the Job owner's original project and session");
-    const inventory = owner ? undefined : await discoverJobs(root, session, ctx, settingsFor(ctx));
+    const inventory = owner instanceof DurableJobs ? undefined : await discoverJobs(root, session, ctx, settingsFor(ctx));
     if (inventory?.error) throw new Error(`Cannot verify detached notice ownership: ${inventory.error}`);
     if (owner?.jobs.has(id) || inventory?.jobs.some(job => job.id === id)) throw new Error("Session Jobs require explicit management; only detached independent notices can be dismissed");
     setRecoveryNotice(projectRoot(ctx.cwd), id, dismissed);
-    recovery = await discoverJobs(projectRoot(ctx.cwd), ctx.sessionManager.getSessionId(), ctx, settingsFor(ctx), false, !!owner);
+    recovery = await discoverJobs(projectRoot(ctx.cwd), ctx.sessionManager.getSessionId(), ctx, settingsFor(ctx), false, owner instanceof DurableJobs);
     return { id, dismissed, note: "Only the recovery notice changed. The original worker, records and ownership are retained." };
   };
   const attachJob = async (id: string, hostName: string, ctx: ExtensionContext, signal?: AbortSignal) => {
@@ -211,19 +219,19 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
     const choice = await ctx.ui.select(`Restore saved Jobs?\n${rows}`, [...(unfinished ? ["Resume saved Jobs", "Cancel saved Jobs"] : []), ...(!unfinished && inventory.independent.some(job => job.hostName && !job.terminal) ? ["Attach an independent Job"] : []), ...(inventory.independent.length ? ["Dismiss an independent notice"] : []), "Inspect saved Jobs", "Keep suspended"], { timeout: 30000 });
     if (choice === "Resume saved Jobs") await restoreJobs(ctx);
     else if (choice === "Cancel saved Jobs") {
-      if (await ctx.ui.confirm("Cancel this session's saved Jobs?", "This includes independent remote Jobs already attached to this session. Detached Jobs from other parents require attach, then stop. Worktrees and recorded outcomes are retained.")) await cancelSaved(ctx);
+      if (await ctx.ui.confirm("Cancel this session's saved Jobs?", "This includes independent remote Jobs already attached to this session. Detached Jobs from other parents require attach, then stop. Worktrees and recorded outcomes are retained.", { timeout: 30000 })) await cancelSaved(ctx, true);
     }
     else if (choice === "Attach an independent Job") {
       const candidates = inventory.independent.filter(job => job.hostName);
-      const selected = await ctx.ui.select("Independent Jobs", candidates.map(job => `${job.id} · ${job.hostName} · ${job.state} · ${job.availability}`));
+      const selected = await ctx.ui.select("Independent Jobs", candidates.map(job => `${job.id} · ${job.hostName} · ${job.state} · ${job.availability}`), { timeout: 30000 });
       const job = candidates.find(job => selected?.startsWith(job.id));
       if (job) await attachJob(job.id, job.hostName!, ctx);
     }
     else if (choice === "Inspect saved Jobs") await showJobDetail(ctx, "Saved Jobs", inventory);
     else if (choice === "Dismiss an independent notice") {
-      const selected = await ctx.ui.select("Dismiss recovery notice", inventory.independent.map(job => `${job.id} · ${job.host} · ${job.state}`));
+      const selected = await ctx.ui.select("Dismiss recovery notice", inventory.independent.map(job => `${job.id} · ${job.host} · ${job.state}`), { timeout: 30000 });
       const job = inventory.independent.find(job => selected?.startsWith(job.id));
-      if (job && await ctx.ui.confirm("Dismiss this notice?", "This does not stop or delete the Job. Use recovery with include_dismissed to show it again.")) await changeNotice(job.id, true, ctx);
+      if (job && await ctx.ui.confirm("Dismiss this notice?", "This does not stop or delete the Job. Use recovery with include_dismissed to show it again.", { timeout: 30000 })) await changeNotice(job.id, true, ctx);
     }
   };
   pi.on("session_start", async (_event, ctx) => {
@@ -273,29 +281,30 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
     },
   });
   register({ name: "piccolo_jobs", label: "Observe and manage session jobs",
-    description: "List/status/result/result_page/ack/stop/message/wait for this session's jobs. Recovery lists suspended session work and detached independent notices with pagination; resume/cancel_saved are explicit decisions. Dismiss hides only a detached independent recovery notice, show_notice restores it, and recovery include_dismissed lists hidden notices. Returning from submission or pressing Esc does not stop a job. Messages default to the current or next implementation coordinator; schedules require an explicit target shown in status. Delivery receipts show observed input delivery or a Durable answer; they do not prove the model acted on the instruction. Durable experiment_report supports paginated comparison JSON, assess records immutable rubric assessments, and export_schedule projects settled candidates into the roadmap. For truncated results use result_page with revision and offset, reading every page. Inspect result, then ack its outcome_revision with a decision note; optional replacement links a later same-kind job without deleting history. Ended jobs never restart. Saved Durable work is discovered for its parent session; records from unrelated native sessions require manual reconciliation.",
-    parameters: Type.Object({ action: Type.Union(["list", "recovery", "dismiss", "show_notice", "resume", "cancel_saved", "suspend", "attach", "status", "result", "result_page", "ack", "stop", "message", "wait", "export_schedule", "experiment_report", "assess"].map(action => Type.Literal(action))), include_dismissed: Type.Optional(Type.Boolean()), id: Type.Optional(Type.String()), host: Type.Optional(Type.String()), revision: Type.Optional(Type.String()), note: Type.Optional(Type.String()), assessment: Type.Optional(Type.Object({ trial: Type.String(), outcomeDigest: Type.String(), verdict: Type.Union([Type.Literal("pass"), Type.Literal("fail"), Type.Literal("uncertain")]), assessor: Type.String(), provenance: Type.Union([Type.Literal("human_reported"), Type.Literal("agent_reported")]), evidence: Type.Array(Type.String()), note: Type.String() })), replacement: Type.Optional(Type.String()), text: Type.Optional(Type.String()), target: Type.Optional(Type.String()), message_id: Type.Optional(Type.String({ format: "uuid" })), wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: 30000 })), offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })) }),
+    description: "List/status/result/result_page/ack/stop/message/wait for this session's jobs. Recovery lists suspended session work and detached independent notices with pagination; resume/cancel_saved are explicit decisions. cancel_saved is limited to suspended saved work; include_independent=true explicitly includes already attached independent Jobs. Use stop for an active Job. Dismiss hides only a detached independent recovery notice, show_notice restores it, and recovery include_dismissed lists hidden notices. Returning from submission or pressing Esc does not stop a job. Messages default to the current or next implementation coordinator; schedules require an explicit target shown in status. Delivery receipts show observed input delivery or a Durable answer; they do not prove the model acted on the instruction. Durable experiment_report supports paginated comparison JSON, assess records immutable rubric assessments, and export_schedule projects settled candidates into the roadmap. For truncated results use result_page with revision and offset, reading every page. Inspect result, then ack its outcome_revision with a decision note; optional replacement links a later same-kind job without deleting history. Ended jobs never restart. Saved Durable work is discovered for its parent session; records from unrelated native sessions require manual reconciliation.",
+    parameters: Type.Object({ action: Type.Union(["list", "recovery", "dismiss", "show_notice", "resume", "cancel_saved", "suspend", "attach", "status", "result", "result_page", "ack", "stop", "message", "wait", "export_schedule", "experiment_report", "assess"].map(action => Type.Literal(action))), include_dismissed: Type.Optional(Type.Boolean()), include_independent: Type.Optional(Type.Boolean()), id: Type.Optional(Type.String()), host: Type.Optional(Type.String()), revision: Type.Optional(Type.String()), note: Type.Optional(Type.String()), assessment: Type.Optional(Type.Object({ trial: Type.String(), outcomeDigest: Type.String(), verdict: Type.Union([Type.Literal("pass"), Type.Literal("fail"), Type.Literal("uncertain")]), assessor: Type.String(), provenance: Type.Union([Type.Literal("human_reported"), Type.Literal("agent_reported")]), evidence: Type.Array(Type.String()), note: Type.String() })), replacement: Type.Optional(Type.String()), text: Type.Optional(Type.String()), target: Type.Optional(Type.String()), message_id: Type.Optional(Type.String({ format: "uuid" })), wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: 30000 })), offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })) }),
     async execute(_id, params, _signal, _update, ctx) {
       if (params.action === "dismiss" || params.action === "show_notice") return response(await changeNotice(params.id ?? "", params.action === "dismiss", ctx));
       if (params.action === "recovery") {
         if (owner) {
           if (owner instanceof DurableJobs) await owner.refresh();
-          const inventory = await discoverJobs(projectRoot(ctx.cwd), owner.session, ctx, settingsFor(ctx), params.include_dismissed, true);
+          const inventory = await discoverJobs(projectRoot(ctx.cwd), owner.session, ctx, settingsFor(ctx), params.include_dismissed, owner instanceof DurableJobs);
           inventory.independent = inventory.independent.filter(job => !owner!.jobs.has(job.id));
-          inventory.jobs = owner.list(0, 10000).map(job => ({ id: job.id, kind: job.kind, owner: owner!.session, lifetime: job.lifetime,
-            host: job.host ?? "local", state: job.state, terminal: !!job.outcome_revision, availability: "unchecked", parentReview: job.parent_review.disposition,
-            outcomeRevision: job.outcome_revision, attention: (job as any).attention }));
+          const active = owner.list(0, 10000).map(job => ({ id: job.id, kind: job.kind, owner: owner!.session, lifetime: job.lifetime,
+            host: job.host ?? "local", state: job.state, terminal: !!job.outcome_revision, availability: "unchecked" as const, parentReview: job.parent_review.disposition,
+            outcomeRevision: job.outcome_revision, attention: (job as any).attention, reason: job.error, hasResult: job.has_result }));
+          inventory.jobs = owner instanceof DurableJobs ? active : [...active, ...inventory.jobs.filter(job => !owner!.jobs.has(job.id))];
           return response({ ...recoveryPage(inventory, params.offset, params.limit), active: true });
         }
         recovery = await probeJobs(await discoverJobs(projectRoot(ctx.cwd), ctx.sessionManager.getSessionId(), ctx, settingsFor(ctx), params.include_dismissed), projectRoot(ctx.cwd)); return response(recoveryPage(recovery, params.offset, params.limit));
       }
       if (params.action === "resume") return response({ jobs: await restoreJobs(ctx) });
-      if (params.action === "cancel_saved") return response({ jobs: await cancelSaved(ctx), cancellation_requested: true });
+      if (params.action === "cancel_saved") return response({ jobs: await cancelSaved(ctx, params.include_independent), cancellation_requested: true });
       if (params.action === "attach") return attachJob(params.id ?? "", params.host ?? "", ctx, _signal);
       if (params.action === "suspend") {
         if (!(owner instanceof DurableJobs)) throw new Error("Suspend requires active Durable Jobs");
         await owner.close("suspend"); suspendOnShutdown = false; unregister?.(); unregister = undefined; owner = undefined; workspace = undefined;
-        recovery = await discoverJobs(projectRoot(ctx.cwd), ctx.sessionManager.getSessionId(), ctx, settingsFor(ctx)); redraw(); return response({ suspended: true, recovery });
+        recovery = await discoverJobs(projectRoot(ctx.cwd), ctx.sessionManager.getSessionId(), ctx, settingsFor(ctx)); redraw(); return response({ suspended: true, recovery: recoveryPage(recovery) });
       }
       if (params.action === "list") {
         if (!owner && recovery) return response({ ...recoveryPage(recovery, params.offset, params.limit), suspended: true });
@@ -325,7 +334,7 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
       if (!ctx.hasUI) throw new Error("Use piccolo_jobs in noninteractive mode");
       uiContext = ctx;
       if (!owner && recovery) {
-        const action = await ctx.ui.select("Saved Jobs", ["Resume saved Jobs", "Inspect saved Jobs", "Keep suspended"]);
+        const action = await ctx.ui.select("Saved Jobs", ["Resume saved Jobs", "Inspect saved Jobs", "Keep suspended"], { timeout: 30000 });
         if (action === "Resume saved Jobs") await restoreJobs(ctx);
         else if (action === "Inspect saved Jobs") { await showJobDetail(ctx, "Saved Jobs", recovery); return; }
         else return;
@@ -334,21 +343,21 @@ export async function registerJobs(pi: ExtensionAPI, schemas: Record<JobKind, TS
         const current = owner;
         const id = await showJobList(ctx, () => owner === current ? current.list(0, 1000) : []);
         if (!id || owner !== current) return;
-        const action = await ctx.ui.select(plain(`${id}: ${owner.status(id).state}`), ["Status", "Result", "Acknowledge result", "Send instruction", "Stop job", "Back"]);
+        const action = await ctx.ui.select(plain(`${id}: ${owner.status(id).state}`), ["Status", "Result", "Acknowledge result", "Send instruction", "Stop job", "Back"], { timeout: 30000 });
         if (!action) return;
-        if (action === "Stop job") { if (await ctx.ui.confirm("Stop this job?", id)) await owner.stop(id); }
+        if (action === "Stop job") { if (await ctx.ui.confirm("Stop this job?", id, { timeout: 30000 })) await owner.stop(id); }
         else if (action === "Acknowledge result") {
-          const note = await ctx.ui.input("Decision after inspecting Result");
+          const note = await ctx.ui.input("Decision after inspecting Result", undefined, { timeout: 30000 });
           if (note) {
             try { await owner.acknowledge(id, owner.status(id).outcome_revision ?? "", note); }
             catch (error) { ctx.ui.notify(String(error), "error"); }
           }
         }
         else if (action === "Send instruction") {
-          const text = await ctx.ui.input("Instruction");
+          const text = await ctx.ui.input("Instruction", undefined, { timeout: 30000 });
           if (text) {
             const targets = owner.status(id).children.map(child => child.id);
-            const target = targets.length > 1 || ["schedule", "experiment"].includes(owner.status(id).kind) ? await ctx.ui.select("Target coordinator", [...new Set(targets)]) : undefined;
+            const target = targets.length > 1 || ["schedule", "experiment"].includes(owner.status(id).kind) ? await ctx.ui.select("Target coordinator", [...new Set(targets)], { timeout: 30000 }) : undefined;
             if ((targets.length > 1 || ["schedule", "experiment"].includes(owner.status(id).kind)) && !target) return;
             if (!["schedule", "experiment"].includes(owner.status(id).kind) || target) await owner.message(id, text, target);
           }

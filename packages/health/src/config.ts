@@ -15,7 +15,7 @@ export const healthConfig = z.strictObject({
   max_attempts: z.number().int().min(1).max(20).default(3),
   max_wakes: z.number().int().min(1).max(10000).default(128),
   recovery: z.enum(["wake", "observe"]).default("wake"),
-  compatibility: z.enum(["off", "managed", "managed-0.85.1", "managed-0.86.1", "managed-1.3.0", "managed-1.4.0"]).default("off"),
+  compatibility: z.enum(["off", "native-v1", "managed", "managed-0.85.1", "managed-0.86.1", "managed-1.3.0", "managed-1.4.0"]).default("off"),
   diagnostic: z.strictObject({
     enabled: z.boolean().default(false),
     model: z.string().regex(/^[^/\s]+\/\S+$/).optional(),

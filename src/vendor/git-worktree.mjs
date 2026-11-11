@@ -72,23 +72,61 @@ export function planWorktreeArea(cwd) {
   return { format: 1, ownerRoot, area, ignoreFile, ignoreRule: "/.worktrees/", ignoreMissing: !hasRule || !ignored, areaMissing: !areaStat };
 }
 export function prepareWorktreeArea(cwd) {
-  const plan = planWorktreeArea(cwd);
-  if (plan.ignoreMissing) {
-    const old = stat(plan.ignoreFile) ? fs.readFileSync(plan.ignoreFile, "utf8") : "";
-    const fd = fs.openSync(plan.ignoreFile, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0), 0o644);
-    try { fs.writeFileSync(fd, `${old && !old.endsWith("\n") ? "\n" : ""}${plan.ignoreRule}\n`); }
-    finally { fs.closeSync(fd); }
+  const initial = planWorktreeArea(cwd);
+  if (!initial.ignoreMissing && !initial.areaMissing) return initial;
+  const common = fs.realpathSync(line(git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")));
+  const lock = path.join(common, "nv-worktree-prepare.lock"), deadline = Date.now() + 10000;
+  let descriptor;
+  while (descriptor === undefined) {
+    try { descriptor = fs.openSync(lock, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600); }
+    catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const current = planWorktreeArea(cwd);
+      if (!current.ignoreMissing && !current.areaMissing) return current;
+      if (Date.now() >= deadline) throw new Error("Task worktree preparation is busy; retry after the current preparation finishes or reconcile its stale preparation lock");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
   }
-  if (plan.areaMissing) fs.mkdirSync(plan.area, { mode: 0o700 });
-  return planWorktreeArea(cwd);
+  const owned = fs.fstatSync(descriptor);
+  try {
+    const plan = planWorktreeArea(cwd);
+    if (plan.ignoreMissing) {
+      const fd = fs.openSync(plan.ignoreFile, fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0), 0o644);
+      try {
+        const old = fs.readFileSync(fd, "utf8");
+        fs.writeFileSync(fd, `${old && !old.endsWith("\n") ? "\n" : ""}${plan.ignoreRule}\n`);
+      } finally { fs.closeSync(fd); }
+    }
+    if (plan.areaMissing) try { fs.mkdirSync(plan.area, { mode: 0o700 }); }
+    catch (error) { if (error.code !== "EEXIST") throw error; planWorktreeArea(cwd); }
+    return planWorktreeArea(cwd);
+  } finally {
+    fs.closeSync(descriptor);
+    const current = stat(lock);
+    if (current?.dev === owned.dev && current?.ino === owned.ino) fs.unlinkSync(lock);
+  }
+}
+
+function resolveExistingParent(parent) {
+  const remaining = [];
+  let current = parent;
+  while (true) {
+    try { return path.join(fs.realpathSync(current), ...remaining); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      if (stat(current)) throw new Error("Explicit worktree parent contains an unresolved symbolic link");
+      remaining.unshift(path.basename(current));
+      const next = path.dirname(current);
+      if (next === current) throw error;
+      current = next;
+    }
+  }
 }
 
 /** Explicit locations remain explicit. Only the standard parent is prepared. */
 export function planWorktreeParent(cwd, destination) {
   const original = path.resolve(destination), originalParent = path.dirname(original);
-  let target = original;
-  try { target = path.join(fs.realpathSync(originalParent), path.basename(original)); }
-  catch (error) { if (error.code !== "ENOENT") throw error; }
+  const target = path.join(resolveExistingParent(originalParent), path.basename(original));
   const parent = path.dirname(target);
   const common = fs.realpathSync(line(git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")));
   if (target === common || target.startsWith(common + path.sep)) throw new Error("Task worktrees cannot be placed inside Git administrative metadata");

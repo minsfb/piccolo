@@ -109,7 +109,7 @@ export const MANAGED_140_PROFILE: ManagedWakeProfile = {
 export function managedWakeProfile(version: string, platform: NodeJS.Platform = process.platform): ManagedWakeProfile | undefined {
   return [MANAGED_0851_PROFILE, ...MANAGED_0861_PROFILES, MANAGED_130_PROFILE, MANAGED_140_PROFILE].find(profile => profile.version === version && profile.platform === platform);
 }
-type Token = { session: any; state: State; epoch: number; identity: string; release(): void; accept?(): void; rejected?: boolean; started?: boolean; command?: boolean };
+type Token = { session: any; state: State; epoch: number; identity: string; release(): void; accept?(): void; rejected?: boolean; started?: boolean; command?: boolean; settledRequests?: Array<{ kind: "prompt" | "custom"; args: any[] }> };
 type State = { epoch: number; disposed: boolean; gate?: Promise<void>; release?: () => void; wake?: Promise<unknown>; ids: Set<string>; guardAttempted?: boolean; guards?: Array<{ target: any; name: string; fn: Function }> };
 export type ManagedWakeAdapter = { status: "installed" | "unsupported"; profile?: string; qualification?: ManagedWakeProfile; reason?: string; supports(context: unknown): boolean; request(context: unknown, request: WakeRequest): WakeReceipt };
 const INSTALLED = Symbol.for("pi.harness.health.managed-wake.adapter.v1");
@@ -189,6 +189,12 @@ export function installManagedWake(AgentSession: any, version: string, profile: 
     if (!state.guardAttempted) bindGuards(session, session._extensionRunner);
     if (!state.guards?.every(g => g.target[g.name] === g.fn)) return originals[kind === "prompt" ? "prompt" : "sendCustomMessage"].apply(session, args);
     const current = ownership.getStore();
+    if (cleanup && state.gate && current && current.session === session && session._isEmittingAgentSettled) {
+      // Match native turn deferral, then drain only after context restoration
+      // and the cancelled preparation's admission gate have both settled.
+      (current.settledRequests ??= []).push({ kind, args });
+      return;
+    }
     if (state.gate && current && current.session === session && current.release === state.release && current.command) current.release();
     if (state.gate && current && current.session === session && current.release === state.release) {
       throw new Error("Cannot start inference reentrantly during prompt preflight. Return from the command or input hook before starting another turn, or use nextTurn delivery.");
@@ -207,7 +213,7 @@ export function installManagedWake(AgentSession: any, version: string, profile: 
     // Native prompt moves this array into its prospective messages before
     // before_agent_start. Retain the reference so an aborted preflight cannot
     // silently consume context that was never submitted to the agent.
-    const nextTurn = kind === "prompt" ? session._pendingNextTurnMessages : undefined;
+    const nextTurn = kind === "prompt" || modern ? session._pendingNextTurnMessages : undefined;
     let pendingAccepted = false; let callbackDone = false;
     const callback = kind === "prompt" ? args[1]?.preflightResult : undefined;
     const acknowledge = (accepted: boolean | string) => { if (!callbackDone) { callbackDone = true; callback?.(accepted); } };
@@ -228,7 +234,16 @@ export function installManagedWake(AgentSession: any, version: string, profile: 
       if (!modern) acknowledge(false);
       throw error;
     }
-    finally { if (pendingAccepted && !token.rejected) acknowledge(true); release(); }
+    finally {
+      if (pendingAccepted && !token.rejected) acknowledge(true);
+      release();
+      for (const request of token.settledRequests ?? []) {
+        void ownership.exit(() => admit(session, request.kind, request.args)).catch(error => {
+          try { session._extensionRunner.emitError({ extensionPath: "<runtime>", event: "send_message", error: String(error) }); }
+          catch { /* Native diagnostic failure does not change settled admission. */ }
+        });
+      }
+    }
   }
   const methods: Record<string, Function> = {
     prompt: function (this: any, ...args: any[]) { return admit(this, "prompt", args); },
@@ -293,13 +308,13 @@ export function installManagedWake(AgentSession: any, version: string, profile: 
         });
       } catch (error) {
         if (cleanup && rejectedAfterPreparation) {
-          // No agent request was admitted, and this token still owns the gate.
-          // Clear only this prepared run, then use captured native settlement.
+          // No agent request was admitted. Clear this prepared run and flush
+          // passive messages before using captured native settlement.
           this._isAgentRunActive = false;
           this._runSystemPromptOptions = undefined;
           this._agentRunAbortRequested = true;
-          try { await originals._emitAgentSettled.call(this); }
-          catch (settlement) { throw new AggregateError([error, settlement], "Interrupted startup settlement failed"); }
+          try { this._flushPendingBashMessages(); this._flushPendingCustomMessages(); await originals._emitAgentSettled.call(this); }
+          catch (settlement) { throw new AggregateError([error, settlement], `Interrupted startup settlement failed: ${error instanceof Error ? error.message : String(error)}`); }
           finally { originals._resolveIdleWaitIfIdle.call(this); }
         }
         throw error;

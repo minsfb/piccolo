@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture a managed Pi runtime fingerprint without inference or installed-file changes.
+"""Capture a managed Pi runtime fingerprint in memory without inference.
 
 Run once from a normal terminal. Creates a new private evidence root and an
 isolated Pi agent directory. Capturing a profile does NOT qualify safe wake.
@@ -24,10 +24,10 @@ METHODS = (
 )
 MODERN_METHODS = tuple(name for name in METHODS if name != "_runAgentPrompt") + ("_startRun", "_prepareRun", "_normalizePromptImages")
 BOUND_METHODS = ("emitInput", "emitBeforeAgentStart", "checkAuth")
-CLEANUP_METHODS = MODERN_METHODS + ("_emitAgentSettled", "_resolveIdleWaitIfIdle")
+PI_140_METHODS = MODERN_METHODS + ("_emitAgentSettled", "_resolveIdleWaitIfIdle")
 
 def expected_methods(version):
-    return CLEANUP_METHODS if version == "1.4.0" else MODERN_METHODS if version == "1.3.0" else METHODS
+    return PI_140_METHODS if version == "1.4.0" else MODERN_METHODS if version == "1.3.0" else METHODS
 
 
 PROBE = r'''import fs from "node:fs";
@@ -127,7 +127,7 @@ def read_bounded(file):
 
 
 def validate_profile(profile):
-    if not isinstance(profile, dict) or profile.get("format") != 1 or profile.get("qualified") is not False:
+    if not isinstance(profile, dict) or type(profile.get("format")) is not int or profile.get("format") != 1 or profile.get("qualified") is not False:
         return False
     if not isinstance(profile.get("version"), str) or not re.fullmatch(r"\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?", profile["version"]):
         return False

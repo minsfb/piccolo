@@ -8,7 +8,7 @@ import { requireIgnoredArtifacts } from "./artifacts.ts";
 import { randomUUID } from "node:crypto";
 
 export type RemoteWorker = { workspace: Workspace; transport: string[] };
-export type AdmissionRejection = { state: "rejected"; requestId: string; fingerprint: string };
+export type AdmissionRejection = { state: "rejected"; requestId: string; fingerprint: string; error?: string };
 export class RemoteRejected extends Error {
   readonly admission?: AdmissionRejection;
   constructor(message: string, admission?: AdmissionRejection) { super(message); this.admission = admission; }
@@ -16,6 +16,7 @@ export class RemoteRejected extends Error {
 export type DispatchState = { assignment: string; requestId: string; state: "terminal" | "rejected"; outcomeDigest: string; handled: boolean };
 export function readDispatchState(root: string, requestId: string): DispatchState | undefined {
   z.string().uuid().parse(requestId);
+  try {
   const file = path.join(root, ".cache", "piccolo", "dispatch", `${requestId}.state.json`);
   if (!fs.existsSync(file)) return;
   const stat = fs.lstatSync(file);
@@ -31,6 +32,7 @@ export function readDispatchState(root: string, requestId: string): DispatchStat
     }
   }
   return value;
+  } catch { return undefined; } // Malformed advisory cache cannot hide retained work.
 }
 /** Advisory discovery cache, bound to the immutable assignment. It cannot admit,
  * resume or cancel work and contains no prompts/transcripts. */
@@ -62,7 +64,7 @@ export function retainedAssignment(root: string, target: RemoteWorker, requestId
   return intent;
 }
 export async function workerRequest(target: RemoteWorker, request: unknown, signal?: AbortSignal, timeoutMs = 40000) {
-  const value = { ...workerRequestSchema.parse(request), workspace: target.workspace };
+  const value = workerRequestSchema.parse({ ...(request as object), workspace: target.workspace });
   const response = await transportRequest(target.transport, value, timeoutMs, true, 16 * 1024 * 1024, signal);
   if (response.error) throw new RemoteRejected(response.error, response.admission);
   return response.result;

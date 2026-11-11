@@ -4,11 +4,12 @@ import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { parse } from "smol-toml";
 import { z } from "zod";
-import { digest } from "./config.ts";
+import { digest, referenceNameSchema } from "./config.ts";
 import { git } from "./workflow.ts";
 import { writeNew } from "./records.ts";
 import { checkName, checkSpecSchema } from "./validation-schema.ts";
 import { prepareWorktreeArea, worktreeName } from "./worktree-placement.ts";
+import { requireIgnoredArtifacts } from "./durable/artifacts.ts";
 
 const key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/).refine(v => !["constructor", "prototype", "__proto__"].includes(v));
 const criterion = z.discriminatedUnion("kind", [
@@ -19,7 +20,7 @@ const criterion = z.discriminatedUnion("kind", [
 export const experimentSchema = z.strictObject({
   format: z.literal(1), name: key, repetitions: z.number().int().min(2).max(20).default(3),
   tasks: z.record(key, z.strictObject({ kind: z.enum(["delegate", "workflow"]), task: z.string().min(1).max(32000),
-    type: key.optional(), job: key.optional(), max_revisions: z.number().int().min(0).max(5).default(0),
+    type: referenceNameSchema.optional(), job: referenceNameSchema.optional(), max_revisions: z.number().int().min(0).max(5).default(0),
     checks: z.record(checkName, checkSpecSchema).optional(), criterion,
   })),
   variants: z.record(key, z.strictObject({ profile: z.string().min(1).max(100).optional(),
@@ -85,9 +86,14 @@ export async function runExperiment(root: string, plan: Plan, provenance: unknow
   if (git(root, "diff", "HEAD", "--", ":(exclude).piccolo").length) throw new Error("Commit source changes, including any prepared /.worktrees/ ignore rule, before an experiment");
   const untracked = git(root, "ls-files", "--others", "--exclude-standard").split("\n").filter(p => p && !p.startsWith(".piccolo/"));
   if (untracked.length) throw new Error("Untracked inputs outside .piccolo prevent reproducible source binding");
+  const id = randomUUID(), storage = path.join(root, ".cache", "piccolo", "experiments", id);
+  requireIgnoredArtifacts(root, [path.join(storage, "launch.json"), path.join(storage, "outcome.json"),
+    ...plan.trials.flatMap(trial => ["launch.json", "outcome.json", "assessment.json"].map(file => path.join(storage, trial.id, file)))]);
   const worktrees = prepareWorktreeArea(root).area;
   if (git(root, "diff", "HEAD", "--", ":(exclude).piccolo").length) throw new Error("Commit the prepared /.worktrees/ ignore rule before freezing an experiment source");
-  const id = randomUUID(), directory = home(root, id, true);
+  const preparedUntracked = git(root, "ls-files", "--others", "--exclude-standard").split("\n").filter(p => p && !p.startsWith(".piccolo/"));
+  if (preparedUntracked.length) throw new Error("Commit untracked inputs created during worktree preparation before freezing an experiment source");
+  const directory = home(root, id, true);
   const launch = { format: 1, id, base, host: os.hostname(), platform: process.platform, node: process.version,
     created_at: new Date().toISOString(), plan, provenance };
   writeNew(path.join(directory, "launch.json"), launch);
@@ -129,6 +135,7 @@ export function assessExperiment(root: string, id: string, input: unknown) {
   if (outcome.criterion.kind !== "rubric") throw new Error("Only rubric criteria accept reported assessments; deterministic outcomes cannot be waived");
   // Reported assessments never replace execution status or pretend to be harness execution.
   const file = path.join(directory, value.trial, "assessment.json");
+  requireIgnoredArtifacts(root, [file]);
   writeNew(file, { format: 1, ...value, at: new Date().toISOString() }); return { record: file };
 }
 export function reportExperiment(root: string, id: string) {

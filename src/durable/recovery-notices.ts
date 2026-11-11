@@ -18,9 +18,11 @@ function readFile(file: string, limit: number) {
 }
 export function recoveryNoticeDismissed(root: string, id: string, intent: unknown) {
   z.string().uuid().parse(id);
-  const file = path.join(directory(root), `${id}.dismissed.json`);
-  if (!fs.existsSync(file)) return false;
-  try { const value = readFile(file, 16000); return value.version === 1 && value.id === id && value.intent === digest(intent) && value.dismissed === true; }
+  try {
+    const file = path.join(directory(root), `${id}.dismissed.json`);
+    if (!fs.existsSync(file)) return false;
+    const value = readFile(file, 16000); return value.version === 1 && value.id === id && value.intent === digest(intent) && value.dismissed === true;
+  }
   catch { return false; } // Invalid advisory state cannot hide work.
 }
 /** Dismiss only the notice. No transport, cancellation, transcript deletion or ownership change. */

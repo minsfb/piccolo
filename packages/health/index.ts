@@ -42,6 +42,8 @@ export function registerHealth(pi: ExtensionAPI, dependencies: Dependencies = {}
   // Installation belongs to the process; permission to use it belongs to this
   // live monitor's configuration. Do not revoke another SDK session's adapter.
   const allowManagedWake = () => !closed && !storageFailed && settings?.enabled === true && selectsManagedWake(settings.compatibility, VERSION);
+  // Experimental explicit selection until a released runtime is qualified.
+  const allowNativeWake = () => !closed && !storageFailed && settings?.enabled === true && settings.compatibility === "native-v1";
   let lastTickAt = 0;
   let pendingWake: string | undefined, recoveryTurn: string | undefined;
   let compaction: string | undefined;
@@ -61,11 +63,14 @@ export function registerHealth(pi: ExtensionAPI, dependencies: Dependencies = {}
   const facts = (history = false, id?: string) => {
     const all = monitor?.list({ includeHistory: history }) ?? [];
     const selected = id ? all.filter(incident => incident.id === id) : all;
+    const wakeCapability = !!ctx && hasParentWake(ctx, allowManagedWake(), allowNativeWake());
+    const wakeReason = wakeCapability ? undefined : closed ? "inactive" : settings?.compatibility === "off" ? "managed_compatibility_disabled" :
+      settings?.compatibility === "native-v1" ? "native_contract_unavailable" : settings && !selectsManagedWake(settings.compatibility, VERSION) ? "runtime_version_mismatch" : "unqualified_runtime_or_context";
     return ({
     scope: "harness-only", active: !closed, storage_failed: storageFailed, recording_failure: recordingFailure,
     parent_idle: !closed && !!ctx && ctx.isIdle(),
     recovery: settings?.recovery, diagnostic_enabled: settings?.diagnostic.enabled,
-    wake_capability: !!ctx && hasParentWake(ctx, allowManagedWake()), compatibility: settings?.compatibility,
+    wake_capability: wakeCapability, wake_unavailable_reason: wakeReason, compatibility: settings?.compatibility,
     diagnostic_calls: diagnosticCalls, diagnostic_running: diagnosticRunning, diagnostic_disabled: diagnosticDisabled, last_diagnosis: lastDiagnosis,
     incidents_total: all.length, incidents_truncated: selected.length > 100,
     incidents: selected.slice(0, 100).map(i => ({ ...i, reference: references.get(i.source) })),
@@ -177,7 +182,7 @@ export function registerHealth(pi: ExtensionAPI, dependencies: Dependencies = {}
         const incident = monitor.list().find(i => i.id === action.incidentId)!;
         const reference = references.get(incident.source);
         const content = `[Harness health ${action.id}] Inspect harness_health status with id ${incident.id}. Observed ${incident.component}/${incident.code}.${reference ? ` Affected session job: ${reference.id}; inspect its status/result.` : ""} Decide how to handle it, then record a disposition with harness_health. Notification delivery is not resolution. Do not replay ambiguous project operations.`;
-        const receipt = (dependencies.wake ?? requestParentWake)(context, { sessionId: context.sessionManager.getSessionId(), id: action.id, content }, allowManagedWake());
+        const receipt = (dependencies.wake ?? requestParentWake)(context, { sessionId: context.sessionManager.getSessionId(), id: action.id, content }, allowManagedWake(), allowNativeWake());
         monitor.recordAction(action.id, receipt.status === "accepted" ? "delivered" : receipt.status === "unsupported" ? "unsupported" : receipt.status === "busy" ? "busy" : "failed");
         if (receipt.status === "unsupported") warn("Harness health detected work requiring attention, but safe parent wake is unavailable. Inspect /harness-health; unattended recovery is degraded.");
       }
@@ -256,7 +261,9 @@ export function registerHealth(pi: ExtensionAPI, dependencies: Dependencies = {}
     if (event.isError && !interrupted && event.toolName !== "harness_health") observe({ source: `tool:${event.toolCallId}`, component: "worker", code: "worker_failed" });
   });
   pi.on("before_agent_start", event => {
-    const action = event.messageType === "custom" ? undefined : /^\[Harness health ([a-f0-9-]{36})\]/.exec(event.prompt)?.[1];
+    const text = event.messageType === "custom" ?
+      (event.message.customType === "harness-health-status" && typeof event.message.content === "string" ? event.message.content : "") : event.prompt;
+    const action = /^\[Harness health ([a-f0-9-]{36})\]/.exec(text)?.[1];
     pendingWake = action && monitor?.list().some(incident => incident.actions.some(receipt => receipt.id === action)) ? action : undefined;
   });
   pi.on("agent_start", () => {
@@ -267,7 +274,7 @@ export function registerHealth(pi: ExtensionAPI, dependencies: Dependencies = {}
   pi.events.on(CLAIM, (request: any) => {
     // Do not suppress ordinary notices until the package can actually recover.
     if (!closed && !storageFailed && settings?.recovery === "wake" && ctx && request.sessionId === ctx.sessionManager.getSessionId())
-      request.claimed = hasParentWake(ctx, allowManagedWake());
+      request.claimed = hasParentWake(ctx, allowManagedWake(), allowNativeWake());
   });
   pi.registerTool({
     name: "harness_health", label: "Harness health", ...healthRenderers,

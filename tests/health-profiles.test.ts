@@ -32,6 +32,8 @@ test("Pi 1.4 wake requires the captured Darwin profile, not merely a version or 
   assert.equal(managedWakeProfile("1.4.0", "linux"), undefined);
   assert.equal(managedWakeProfile("1.4.1", "darwin"), undefined);
   const before = Object.getOwnPropertyDescriptors(AgentSession.prototype);
-  assert.equal(installManagedWake(AgentSession, "1.4.0", profile).status, "unsupported");
+  const result = installManagedWake(AgentSession, "1.4.0", profile);
+  assert.equal(result.status, "unsupported");
+  assert.match(result.reason!, process.platform === "darwin" ? /Unqualified runtime method/ : /No qualified runtime profile/);
   assert.deepEqual(Object.getOwnPropertyDescriptors(AgentSession.prototype), before);
 });

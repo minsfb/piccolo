@@ -12,6 +12,10 @@ const count = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const effortSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const context = z.enum(["fresh", "fork"]);
 const name = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_:-]*$/);
+export const referenceNameSchema = name;
+const hostSchema = z.strictObject({ hostname: text, cwd: text, transport: z.array(text).min(1).optional(), worker_identity: z.string().uuid().optional(), worker_transport: z.array(text).min(1).optional(), editor: z.enum(["vscode", "cursor"]).optional() })
+  .refine(host => !!host.worker_identity === !!host.worker_transport, "Durable hosts require both worker_identity and worker_transport")
+  .refine(host => !!host.transport || !!host.worker_transport, "Hosts require a native or Durable transport");
 export const agentSchema = z.strictObject({
   description: text.optional(), model: text.optional(), effort: effortSchema.optional(),
   prompt: z.string().optional(), skills: z.array(text).optional(), tools: z.array(text).optional(),
@@ -32,7 +36,7 @@ const shape = {
   evidence: z.strictObject({ max_return_chars: z.number().int().min(1000).max(100000).optional() }).optional(),
   pool: z.strictObject({ capacity: z.number().int().min(1).max(128).optional(), queue_timeout_ms: count.optional(), max_launches_per_session: count.optional() }).optional(),
   background: z.strictObject({ executor: z.enum(["native", "durable"]).optional(), notifications: z.enum(["follow_up", "notify_only"]).optional(), max_jobs_per_session: count.optional(), shutdown_timeout_ms: z.number().int().min(1000).max(60000).optional() }).optional(),
-  hosts: z.record(name, z.strictObject({ hostname: text, cwd: text, transport: z.array(text).min(1).optional(), worker_identity: z.string().uuid().optional(), worker_transport: z.array(text).min(1).optional(), editor: z.enum(["vscode", "cursor"]).optional() })).optional(),
+  hosts: z.record(name, hostSchema).optional(),
   workflow: z.strictObject({ engine: z.enum(["subagents", "extensible"]).optional() }).optional(),
   operations: z.strictObject({ remove: z.array(text).optional(), reset: z.array(text).optional() }).optional(),
 };

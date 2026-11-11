@@ -18,13 +18,16 @@ import { acquireScheduleLock } from "../scheduler.ts";
 import { waitWithContext } from "./wait.ts";
 import fs from "node:fs";
 import path from "node:path";
+import { JobsDoc, persistAdmission, readAdmissions, readAdmission, resolveAdmission, type Admission } from "./admissions.ts";
+import { Decisions } from "./decisions.ts";
+import { outcomeProjection } from "./outcome.ts";
+export { JobsDoc } from "./admissions.ts";
 
-type Admission = { taskId: number; fingerprint: string; input: WorkerSubmission; originOwner?: string; previousControllers?: number[]; cancellationRequested?: boolean; cancellationError?: string };
-type Jobs = { requests: Record<string, Admission> };
+class SubmissionValidationError extends Error {}
 const WorkerConfiguration = defineDoc<{ fingerprint: string | null; compaction?: CompactionPolicy; policyFingerprint?: string | null }>({ kind: "piccolo.worker-configuration", version: 1, scope: "session", initial: () => ({ fingerprint: null }) });
-export const JobsDoc = defineDoc<Jobs>({ kind: "piccolo.jobs", version: 1, scope: "session", initial: () => ({ requests: {} }) });
 const RejectionsDoc = defineDoc<{ requests: Record<string, { fingerprint: string; error: string }> }>({ kind: "piccolo.rejections", version: 1, scope: "session", initial: () => ({ requests: {} }) });
 const LaunchesDoc = defineDoc<{ initialized: boolean; owners: Record<string, number[]> }>({ kind: "piccolo.stage-launches", version: 1, scope: "session", initial: () => ({ initialized: false, owners: {} }) });
+const WorkerErrors = defineDoc<{ compaction: string | null }>({ kind: "piccolo.worker-errors", version: 1, scope: "session", initial: () => ({ compaction: null }) });
 export { MessagesDoc } from "./messages.ts";
 import type { NativePolicy } from "./native-policy.ts";
 import { MessagesDoc } from "./messages.ts";
@@ -60,6 +63,10 @@ export class DurableWorker {
   private aborts = new Map<string, Promise<any>>();
   private abortErrors = new Map<string, string>();
   private recoveryPending = false;
+  get savedSuspended() { return this.recoveryPending; }
+  private compactionError?: string;
+  private savedCancellationFault?: string;
+  get savedCancellationError() { return this.savedCancellationFault ?? [...this.admissions.values()].find(admission => admission.cancellationError)?.cancellationError; }
   private cancellationRuns = 0;
   get cancellationOnly() { return !!this.options.cancellationOnly; }
   private constructor(harness: Harness, options: WorkerOptions, stage: ReturnType<typeof createStageTask>, workflow: ReturnType<typeof createWorkflowTask>, pipeline: ReturnType<typeof createPipelineTasks>["pipelineTask"]) {
@@ -74,10 +81,11 @@ export class DurableWorker {
     }
     let compaction = compactionSchema.parse(options.compaction ?? DEFAULT_COMPACTION_POLICY);
     const admittedRequests = new WeakSet<object>();
+    const requestErrors = new WeakMap<object, unknown>();
     const guardedModels: Models = { ...options.models, streamSimple(model, transcript, streamOptions) {
       if (options.cancellationOnly) throw new Error("Cancellation-only recovery cannot execute a model");
       const first = transcript.messages[0];
-      if (!first || !admittedRequests.delete(first)) throw new Error("Worker request did not pass capacity and policy checks");
+      if (!first || !admittedRequests.delete(first)) throw (first && requestErrors.get(first)) ?? new Error("Worker request did not pass capacity and policy checks");
       return options.models.streamSimple(model, transcript, streamOptions);
     }, async completeSimple(model, transcript, streamOptions) {
       if (options.cancellationOnly) throw new Error("Cancellation-only recovery cannot compact");
@@ -113,7 +121,8 @@ export class DurableWorker {
         const jobs = (await tx.doc(JobsDoc)).requests;
         let current = await tx.task(id as TaskId), admission: Admission | undefined;
         while (current) {
-          admission = Object.values(jobs).find(item => item.taskId === current!.id);
+          const matched = Object.entries(jobs).find(([, item]) => item.taskId === current!.id);
+          if (matched) admission = await resolveAdmission(tx, matched[0], matched[1]);
           if (admission || !current.owner) break;
           current = await tx.task(current.owner as TaskId);
         }
@@ -128,13 +137,26 @@ export class DurableWorker {
     const workflow = createWorkflowTask(stage, options.prepareWorktree ?? (async () => {}));
     const { pipelineTask, nodeTask } = createPipelineTasks(stage, workflow);
     registry.install(defineExtension({ name: "piccolo-worker", tasks: [stage, workflow, pipelineTask, nodeTask, RemoteTask], tools: registered,
-      hooks: [hook(GenerationTask, { async beforeRequest(request, api, ctx) { await acquireConversation(options.resources, api, ctx);
+      hooks: [hook(GenerationTask, { async beforeRequest(request, api, ctx) { try { await acquireConversation(options.resources, api, ctx);
           if (await hasUncertainEffects(harness, api.conversationId, ctx)) throw new Error("Uncertain tool effect requires parent reconciliation before continuing");
           const result = await options.policy?.beforeRequest(request.messages, api, ctx) ?? request;
           if (!result.messages.length) throw new Error("Policy produced an empty transcript");
           const messages = [{ ...result.messages[0] }, ...result.messages.slice(1)];
-          admittedRequests.add(messages[0]); return { messages }; } }),
-        hook(CompactionTask, { async beforeCompact(compaction, api, ctx) { try { await acquireConversation(options.resources, api, ctx); await options.policy?.beforeCompact(compaction, api, ctx); } catch { return { decline: true as const }; } return undefined; } })] }));
+          admittedRequests.add(messages[0]); return { messages };
+          } catch (error) { if (request.messages[0]) requestErrors.set(request.messages[0], error); throw error; } } }),
+        hook(CompactionTask, { async beforeCompact(compaction, api, ctx) {
+          try { await acquireConversation(options.resources, api, ctx); await options.policy?.beforeCompact(compaction, api, ctx); }
+          catch (error) {
+            worker.compactionError = String(error).replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 1000);
+            await harness.commit(async tx => { (await tx.doc(WorkerErrors)).compaction = worker.compactionError!; }, ctx);
+            return { decline: true as const };
+          }
+          if (worker.compactionError) {
+            await harness.commit(async tx => { (await tx.doc(WorkerErrors)).compaction = null; }, ctx);
+            worker.compactionError = undefined;
+          }
+          return undefined;
+        } })] }));
     const harness = await Harness.open(options.storage, { registry, models: guardedModels, env: options.env, settings: { get compaction() { return compaction; } } }, context);
     options.policy?.bind(harness);
     try {
@@ -155,6 +177,10 @@ export class DurableWorker {
         doc.fingerprint = digest({ compaction, policy }); doc.compaction = compaction; doc.policyFingerprint = policy;
       }, context);
       await harness.commit(async tx => {
+        if (!options.cancellationOnly) {
+          for (const [id, admission] of Object.entries((await tx.doc(JobsDoc)).requests))
+            if (admission.input) await persistAdmission(tx, id, admission as Admission);
+        }
         const launches = await tx.doc(LaunchesDoc);
         if (launches.initialized) return;
         const admissions = (await tx.doc(JobsDoc)).requests;
@@ -164,12 +190,12 @@ export class DurableWorker {
           for (const stage of page.items) {
             let current = stage, owner: string | undefined;
             while (current) {
-              const admission = Object.values(admissions).find(item => item.taskId === current.id);
-              if (admission) { owner = admission.input.owner; break; }
+              const admission = Object.entries(admissions).find(([, item]) => item.taskId === current.id);
+              if (admission) { owner = (await resolveAdmission(tx, admission[0], admission[1])).input.owner; break; }
               if (!current.owner) break;
               const parent = await tx.task(current.owner as TaskId); if (!parent) break; current = parent;
             }
-            if (owner) (launches.owners[owner] ??= []).push(stage.id);
+            if (owner) launches.owners[owner] = [...(launches.owners[owner] ?? []), stage.id];
           }
           cursor = page.next;
         } while (cursor);
@@ -179,8 +205,10 @@ export class DurableWorker {
     options = { ...options, compaction };
     const worker = new DurableWorker(harness, options, stage, workflow, pipelineTask);
     if (options.cancellationOnly) worker.recoveryPending = true;
-    for (const [id, admission] of Object.entries((await harness.snapshot(JobsDoc, context))?.requests ?? {})) worker.admissions.set(id, JSON.parse(JSON.stringify(admission)));
-    try { for (const admission of worker.admissions.values()) {
+    try {
+    worker.compactionError = (await harness.snapshot(WorkerErrors, context))?.compaction ?? undefined;
+    for (const [id, admission] of Object.entries(await readAdmissions(harness, context))) worker.admissions.set(id, JSON.parse(JSON.stringify(admission)));
+    for (const admission of worker.admissions.values()) {
       const live = (await harness.getTask(admission.taskId as TaskId, context))?.state.status !== "terminal";
       // A crash can fall between the Job intent commit and the task abort mark.
       // Reconcile that intent before either automatic or explicit scheduling.
@@ -191,6 +219,7 @@ export class DurableWorker {
     harness.subscribeCommits(publication => {
       for (const change of publication.changes) if (change.type === "task" && change.value.kind === "piccolo.stage" && change.value.state.status === "terminal") {
         try { options.resources?.release(change.value.id); } catch (error) { worker.resourceError = error; }
+        options.policy?.releaseStage(change.value.id);
       }
     });
     // Independent work resumes. Session work is explicitly cancelled by its host's lifecycle.
@@ -205,7 +234,7 @@ export class DurableWorker {
     catch (error) {
       // A durable negative receipt excludes later admission of this request ID.
       // An unreadable/failed store cannot establish definite absence.
-      if (digest(input.workspace) === digest(this.options.workspace)) try {
+      if (error instanceof SubmissionValidationError && digest(input.workspace) === digest(this.options.workspace)) try {
         await this.harness.commit(async tx => {
           if ((await tx.doc(JobsDoc)).requests[input.requestId]) return;
           const doc = await tx.doc(RejectionsDoc);
@@ -226,9 +255,9 @@ export class DurableWorker {
     if (this.options.dispatchOnly && !input.placement) throw new Error("This controller has no local worker policy. Configure PICCOLO_WORKER_POLICY and start a new session for local execution.");
     if (input.kind === "delegate" && input.cwd && !input.placement &&
       (fs.realpathSync(input.cwd) !== input.cwd || (input.cwd !== this.options.workspace.cwd && !input.cwd.startsWith(this.options.workspace.cwd + path.sep)))) throw new Error("Delegate cwd must be canonical and inside its assigned workspace");
-    if (Buffer.byteLength(JSON.stringify(input)) > 8 * 1024 * 1024) throw new Error("Worker submission exceeds 8 MiB; compact captured context");
-    if (JSON.stringify(input.workspace) !== JSON.stringify(this.options.workspace)) throw new Error("Workspace identity mismatch");
-    const existing = (await this.harness.snapshot(JobsDoc, context))?.requests[input.requestId];
+    if (Buffer.byteLength(JSON.stringify(input)) > 8 * 1024 * 1024) throw new SubmissionValidationError("Worker submission exceeds 8 MiB; compact captured context");
+    if (JSON.stringify(input.workspace) !== JSON.stringify(this.options.workspace)) throw new SubmissionValidationError("Workspace identity mismatch");
+    const existing = this.admissions.get(input.requestId);
     if (existing) {
       if (existing.fingerprint !== fingerprint(input)) throw new Error("Request ID reused with different input");
       this.admissions.set(input.requestId, JSON.parse(JSON.stringify(existing)));
@@ -242,10 +271,10 @@ export class DurableWorker {
       Object.values(input.pipeline.nodes).flatMap(node => node.work.kind === "delegate" ? [node.work.stage] : Object.values(node.work.workflow.stages).flat());
     for (const spec of input.placement ? [] : specs) {
       await this.options.validateStage?.(spec);
-      for (const name of spec.tools) if (!available.has(name)) throw new Error(`Unavailable worker tool: ${name}`);
+      for (const name of spec.tools) if (!available.has(name)) throw new SubmissionValidationError(`Unavailable worker tool: ${name}`);
       const model = this.options.models.getModel(spec.model.provider, spec.model.modelId);
-      if (!model) throw new Error("Model unavailable on worker");
-      if (!getSupportedThinkingLevels(model).includes(spec.thinkingLevel)) throw new Error("Requested thinking level is unavailable on worker");
+      if (!model) throw new SubmissionValidationError("Model unavailable on worker");
+      if (!getSupportedThinkingLevels(model).includes(spec.thinkingLevel)) throw new SubmissionValidationError("Requested thinking level is unavailable on worker");
       if (spec.requirements?.host && !["local", this.options.workspace.host].includes(spec.requirements.host)) throw new Error("Worker host does not satisfy the agent requirement");
       if (spec.requirements?.platform && spec.requirements.platform !== process.platform) throw new Error("Worker platform does not satisfy the agent requirement");
       for (const input of spec.requirements?.input ?? []) if (!model.input.includes(input)) throw new Error(`Worker model does not support required ${input} input`);
@@ -253,7 +282,7 @@ export class DurableWorker {
         Array.isArray(message.content) && message.content.some(part => part && typeof part === "object" && !Array.isArray(part) && part.type === "image"))) throw new Error("Worker model does not support captured image input");
     }
     const executionRoot = input.placement?.workspace.cwd ?? this.options.workspace.cwd;
-    if (input.kind === "workflow" && input.workflow.root !== executionRoot) throw new Error("Workflow root differs from worker workspace");
+    if (input.kind === "workflow" && input.workflow.root !== executionRoot) throw new SubmissionValidationError("Workflow root differs from worker workspace");
     if (input.kind === "schedule" || input.kind === "experiment") {
       if (input.pipeline.source.root !== executionRoot || Object.values(input.pipeline.nodes).some(node =>
         (node.work.kind === "workflow" ? node.work.workflow.root : node.work.root) !== executionRoot)) throw new Error("Pipeline root differs from worker workspace");
@@ -270,11 +299,11 @@ export class DurableWorker {
       const existing = doc.requests[input.requestId];
       if (existing) {
         if (existing.fingerprint !== fingerprint(input)) throw new Error("Request ID reused with different input");
-        return JSON.parse(JSON.stringify(existing)) as Admission;
+        return resolveAdmission(tx, input.requestId, existing);
       }
       if ((await tx.doc(RejectionsDoc)).requests[input.requestId]) throw new Error("Request was rejected before admission; use a new identity after reconciliation");
-      if (Object.values(doc.requests).filter(admission => admission.input.owner === input.owner).length >= (this.options.maxJobs ?? 1000)) throw new Error("Session job admission budget reached");
-      if (Object.keys(doc.requests).length >= 10000) throw new Error("Worker admission history limit reached; archive explicitly");
+      if (await this.unreviewedAdmissions(tx, input.owner) >= (this.options.maxJobs ?? 1000)) throw new Error("Session job admission budget reached; inspect and acknowledge completed Jobs");
+      if (Object.keys(doc.requests).length >= 10000) throw new Error("Worker admission history safety limit reached; reconcile and retain this store before starting a new owned store");
       if (lockController.signal.aborted) throw new Error("Schedule coordinator lock lost during admission");
       claims = claimSchedule(this.options.workspace.cwd, input);
       const options = { ownership: { kind: "conversation" as const }, conversationId: root.id };
@@ -283,7 +312,7 @@ export class DurableWorker {
         ? await tx.createTask(this.stage, { spec: input.stage, cwd: input.cwd ?? input.workspace.cwd }, options)
         : input.kind === "workflow" ? await tx.createTask(this.workflow, input.workflow, options) : await tx.createTask(this.pipeline, input.pipeline, options);
       const admission = { taskId, fingerprint: fingerprint(input), input };
-      doc.requests[input.requestId] = admission;
+      await persistAdmission(tx, input.requestId, admission);
       return admission;
     }, context);
     this.harness.resume();
@@ -294,7 +323,7 @@ export class DurableWorker {
       try {
         const persisted = (await this.harness.snapshot(JobsDoc, context))?.requests[input.requestId];
         absent = !persisted;
-        if (persisted) this.admissions.set(input.requestId, JSON.parse(JSON.stringify(persisted)));
+        if (persisted) this.admissions.set(input.requestId, (await readAdmission(this.harness, input.requestId, context))!);
       } catch { /* A failed store cannot prove whether admission committed. */ }
       if (absent && claims) try { claims.rollback(); }
       catch (rollback) { throw new AggregateError([error, rollback], "Schedule admission failed and its new claims need reconciliation"); }
@@ -303,9 +332,21 @@ export class DurableWorker {
     finally { await releaseClaimsLock?.(); }
   }
   async admission(requestId: string) {
-    const admission = (await this.harness.snapshot(JobsDoc, context))?.requests[requestId];
+    const admission = await readAdmission(this.harness, requestId, context);
     if (!admission) throw new Error("Unknown worker request");
     return admission;
+  }
+  private async unreviewedAdmissions(tx: import("@earendil-works/pi-durable").Tx, owner: string) {
+    const decisions = (await tx.doc(Decisions)).decisions;
+    let count = 0;
+    for (const [id, stored] of Object.entries((await tx.doc(JobsDoc)).requests)) {
+      const admission = await resolveAdmission(tx, id, stored);
+      if (admission.input.owner !== owner) continue;
+      const task = await tx.task(admission.taskId as TaskId);
+      const revision = task?.state.status === "terminal" ? outcomeProjection(task.state.outcome, undefined, admission.cancellationError).revision : undefined;
+      if (!revision || decisions[id]?.revision !== revision) count++;
+    }
+    return count;
   }
   /** Attach a disposable controller to independently owned remote work. Its
    * original submission is inspected, never submitted under a new owner.
@@ -323,13 +364,13 @@ export class DurableWorker {
       const doc = await tx.doc(JobsDoc), prior = doc.requests[input.requestId];
       if (prior) {
         if (prior.fingerprint !== fingerprint(input)) throw new Error("Job is already attached with different inputs or assignment");
-        return JSON.parse(JSON.stringify(prior)) as Admission;
+        return resolveAdmission(tx, input.requestId, prior);
       }
-      if (Object.values(doc.requests).filter(item => item.input.owner === owner).length >= (this.options.maxJobs ?? 1000)) throw new Error("Session job admission budget reached");
+      if (await this.unreviewedAdmissions(tx, owner) >= (this.options.maxJobs ?? 1000)) throw new Error("Session job admission budget reached; inspect and acknowledge completed Jobs");
       const taskId = await tx.createTask(RemoteTask, { root: this.options.workspace.cwd, target, submission: original, observe: true },
         { ownership: { kind: "conversation" }, conversationId: root.id });
       const admission = { taskId, fingerprint: fingerprint(input), input, originOwner: original.owner };
-      doc.requests[input.requestId] = admission; return JSON.parse(JSON.stringify(admission)) as Admission;
+      await persistAdmission(tx, input.requestId, admission); return JSON.parse(JSON.stringify(admission)) as Admission;
     }, context);
     this.admissions.set(input.requestId, JSON.parse(JSON.stringify(admission)));
     this.harness.resume(); return admission;
@@ -338,7 +379,7 @@ export class DurableWorker {
     return { capacity: this.options.capacity ?? 8, tools: this.options.tools.map(tool => tool.name),
       nativeExtensionHooks: optionsPolicy(this.options.policy), compaction: "pi-durable", compactionPolicy: this.options.compaction,
       workerContract: 2, submissionFeatures: ["delegate-cwd", "job-origin", "pipeline-timeout", "admission-rejection-receipt"],
-      storage: "single-owner", lifetimes: ["session", "independent"], resourceError: this.resourceError ? String(this.resourceError) : null };
+      storage: "single-owner", lifetimes: ["session", "independent"], resourceError: this.resourceError ? String(this.resourceError) : null, compactionError: this.compactionError ?? null };
   }
   async inspect(requestId: string) {
     const admission = await this.admission(requestId);
@@ -372,7 +413,7 @@ export class DurableWorker {
         phase: stageActivity(child) })), attention, messages };
   }
   async wait(requestId: string, waitContext = context) {
-    if (this.cancellationOnly && this.recoveryPending) throw new Error("Start saved cancellation before waiting on its outcome");
+    if (this.cancellationOnly && this.recoveryPending) throw new Error(this.savedCancellationError ? "Saved cancellation marks failed. Repair storage and retry cancel_saved before waiting." : "Start saved cancellation before waiting on its outcome");
     if (this.recoveryPending) throw new Error("Saved Jobs are suspended; waiting cannot resume them without a recovery decision");
     return this.harness.waitForTask((await this.admission(requestId)).taskId as TaskId, waitContext);
   }
@@ -456,6 +497,14 @@ export class DurableWorker {
       operation = this.harness.abortTask(admission.taskId as TaskId, context).then(async () => {
         let controlled = admission;
         const old = await this.harness.getTask(admission.taskId as TaskId, context);
+        // Adoption needs native scheduling. An individual stop does not authorize
+        // running the rest of a suspended generation; keep the saved receipt for
+        // explicit resumeSaved/cancelSaved instead.
+        if (!this.recoveryPending && admission.input.placement && await this.adoptVerifiedOutcome(requestId, old)) {
+          controlled = this.admissions.get(requestId)!;
+          this.harness.resume();
+          return this.harness.waitForTask(controlled.taskId as TaskId, context);
+        }
         if (admission.input.placement && await this.recoverableController(requestId, old, true)) {
           controlled = await this.replaceRemoteController(requestId, old, true);
           await this.harness.abortTask(controlled.taskId as TaskId, context);
@@ -465,6 +514,10 @@ export class DurableWorker {
           return this.harness.getTask(controlled.taskId as TaskId, context);
         }
         return this.harness.waitForTask(controlled.taskId as TaskId, context);
+      }).then(async task => { if (task) await this.clearCancellationError(requestId, task.id); return task; }).catch(async error => {
+        try { await this.recordCancellationError(requestId, error); }
+        catch (recording) { throw new AggregateError([error, recording], "Cancellation failed and its error could not be recorded; reconcile the saved Job"); }
+        throw error;
       });
       this.aborts.set(requestId, operation);
       operation.then(() => { this.aborts.delete(requestId); this.abortErrors.delete(requestId); }, error => { this.aborts.delete(requestId); this.abortErrors.set(requestId, String(error).slice(0, 1000)); });
@@ -474,10 +527,10 @@ export class DurableWorker {
   stopping(requestId: string) { return this.aborts.has(requestId); }
   abortError(requestId: string) { return this.abortErrors.get(requestId); }
   async cancellationInProgress() {
-    if (this.cancellationRuns) return true;
+    if (this.cancellationRuns || this.aborts.size) return true;
     for (const admission of this.admissions.values()) {
       const task = await this.harness.getTask(admission.taskId as TaskId, context);
-      if (task && task.state.status !== "terminal") return true;
+      if (task?.abortRequested && task.state.status !== "terminal") return true;
     }
     return false;
   }
@@ -485,9 +538,20 @@ export class DurableWorker {
     const value = await this.harness.commit(async tx => {
       const admission = (await tx.doc(JobsDoc)).requests[id];
       admission.cancellationRequested = true; admission.cancellationError = String(error).slice(0, 1000);
-      return JSON.parse(JSON.stringify(admission)) as Admission;
+      return resolveAdmission(tx, id, admission);
     }, context);
     this.admissions.set(id, value);
+  }
+  private async clearCancellationError(id: string, taskId: number) {
+    const value = await this.harness.commit(async tx => {
+      const admission = (await tx.doc(JobsDoc)).requests[id];
+      if (!admission || admission.taskId !== taskId || !admission.cancellationError) return;
+      const task = await tx.task(taskId as TaskId);
+      if (!task || task.state.status !== "terminal" || (task.state.outcome as any).result?.status === "unresolved") return;
+      delete admission.cancellationError;
+      return resolveAdmission(tx, id, admission);
+    }, context);
+    if (value) this.admissions.set(id, value);
   }
   private async recoverableController(id: string, task: any, cancel = false) {
     if (task?.kind !== "piccolo.remote" || task.state.status !== "terminal") return false;
@@ -501,6 +565,21 @@ export class DurableWorker {
     // admission. An unclassified failure is not proof that the original Job ended.
     return true;
   }
+  private async adoptVerifiedOutcome(id: string, old: any) {
+    if (old?.kind !== "piccolo.remote" || old.state.status !== "terminal") return false;
+    const root = await this.harness.root(context);
+    const adopted = await this.harness.commit(async tx => {
+      const doc = await tx.doc(JobsDoc), current = doc.requests[id];
+      const verified = (await tx.doc(RemoteSnapshots)).requests[id]?.task?.state;
+      if (!current || current.taskId !== old.id || verified?.status !== "terminal" || digest(verified.outcome) === digest(old.state.outcome)) return;
+      const taskId = await tx.createTask(RemoteTask, { ...old.input, observe: true, verifiedOutcome: verified.outcome }, { ownership: { kind: "conversation" }, conversationId: root.id });
+      const value = { ...current, taskId, previousControllers: [...(current.previousControllers ?? []), old.id] };
+      delete value.cancellationError; doc.requests[id] = value;
+      return resolveAdmission(tx, id, value);
+    }, context);
+    if (adopted) this.admissions.set(id, adopted);
+    return !!adopted;
+  }
   private async replaceRemoteController(id: string, old: any, cancel = false) {
     const input = old.input;
     const admission = this.admissions.get(id)!;
@@ -512,11 +591,12 @@ export class DurableWorker {
       const doc = await tx.doc(JobsDoc), current = doc.requests[id];
       if (cancel) current.cancellationRequested = true;
       delete current.cancellationError;
-      if (current.taskId !== old.id) return JSON.parse(JSON.stringify(current)) as Admission;
+      if (current.taskId !== old.id) return resolveAdmission(tx, id, current);
       const mustCancel = !!current.cancellationRequested || !!input.cancel;
-      const taskId = await tx.createTask(RemoteTask, { ...input, observe: true, cancel: mustCancel }, { ownership: { kind: "conversation" }, conversationId: root.id });
+      const taskId = await tx.createTask(RemoteTask, { ...input, observe: true, cancel: mustCancel,
+        priorFailure: input.priorFailure ?? String(old.state.outcome.error?.message ?? "Legacy controller failure").slice(0, 1000) }, { ownership: { kind: "conversation" }, conversationId: root.id });
       const value = { ...JSON.parse(JSON.stringify(current)), taskId, ...(mustCancel ? { cancellationRequested: true } : {}), previousControllers: [...(current.previousControllers ?? []), old.id] };
-      doc.requests[id] = value; return value as Admission;
+      doc.requests[id] = value; return resolveAdmission(tx, id, value);
     }, context);
     this.admissions.set(id, repaired);
     // A simultaneous restore may have won replacement. Cancellation belongs to
@@ -529,6 +609,7 @@ export class DurableWorker {
     for (const [id, admission] of this.admissions) {
       if (!admission.input.placement) continue;
       const old = await this.harness.getTask(admission.taskId as TaskId, context);
+      if (await this.adoptVerifiedOutcome(id, old)) continue;
       if (!old || !await this.recoverableController(id, old)) continue;
       const input = old.input as any;
       try {
@@ -549,13 +630,16 @@ export class DurableWorker {
     // Persist every root mark before enabling scheduling; no unselected saved
     // generation, workflow preparation or remote dispatch can start between them.
     const marks = requests.map(([id, admission]) => this.harness.abortTask(admission.taskId as TaskId, context).catch(async error => {
-      await this.recordCancellationError(id, error); throw error;
+      try { await this.recordCancellationError(id, error); }
+      catch (recording) { throw new AggregateError([error, recording], "Cancellation mark failed and its error could not be recorded; saved work remains suspended"); }
+      throw error;
     }));
     const operation = Promise.all(marks).then(async () => {
       for (const [id, admission] of requests) {
         if (failed.has(id) || !admission.input.placement) continue;
         try {
           const old = await this.harness.getTask(admission.taskId as TaskId, context);
+          if (await this.adoptVerifiedOutcome(id, old)) continue;
           if (await this.recoverableController(id, old, true)) {
             // One unavailable assignment must not stop other committed marks.
             await this.replaceRemoteController(id, old, true);
@@ -563,9 +647,12 @@ export class DurableWorker {
         } catch (error) { failed.add(id); await this.recordCancellationError(id, error); }
       }
       this.recoveryPending = false; this.harness.resume();
-      return Promise.all(requests.filter(([id]) => !failed.has(id)).map(([id]) => this.harness.waitForTask(this.admissions.get(id)!.taskId as TaskId, context)));
+      return Promise.all(requests.filter(([id]) => !failed.has(id)).map(async ([id]) => {
+        const task = await this.harness.waitForTask(this.admissions.get(id)!.taskId as TaskId, context);
+        await this.clearCancellationError(id, task.id); return task;
+      }));
     });
-    operation.then(() => { this.cancellationRuns--; }, () => { this.cancellationRuns--; });
+    operation.then(() => { this.cancellationRuns--; this.savedCancellationFault = undefined; }, error => { this.cancellationRuns--; this.savedCancellationFault = String(error).slice(0, 1000); });
     return waitWithContext(operation, waitContext);
   }
   async close(mode: "suspend" | "cancel-session", owner?: string, shutdownMs = 15000) {

@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 
 def main():
@@ -22,7 +23,12 @@ def main():
     child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
 
     closing = threading.Event()
+    failed = threading.Event()
+    ready = threading.Event()
+    service_closed = threading.Event()
     timers = []
+    termination_lock = threading.Lock()
+    termination_deadline = None
 
     def signal_group(sig):
         try:
@@ -31,11 +37,16 @@ def main():
             pass
 
     def terminate_group():
-        signal_group(signal.SIGTERM)
-        timer = threading.Timer(5, lambda: signal_group(signal.SIGKILL))
-        timer.daemon = True
-        timers.append(timer)
-        timer.start()
+        nonlocal termination_deadline
+        with termination_lock:
+            if termination_deadline is not None:
+                return
+            termination_deadline = time.monotonic() + 5
+            signal_group(signal.SIGTERM)
+            timer = threading.Timer(5, lambda: signal_group(signal.SIGKILL))
+            timer.daemon = True
+            timers.append(timer)
+            timer.start()
 
     def close_input(*_args):
         if closing.is_set():
@@ -51,6 +62,7 @@ def main():
     signal.signal(signal.SIGTERM, close_input)
     signal.signal(signal.SIGINT, close_input)
     def startup_timeout():
+        failed.set()
         print(json.dumps({"type": "piccolo_worker_error", "error": "Worker startup did not report ready within 30 seconds"}), flush=True)
         close_input()
 
@@ -70,10 +82,20 @@ def main():
 
     for stream, is_stderr in ((child.stdout, False), (child.stderr, True)):
         threading.Thread(target=read_stream, args=(stream, is_stderr), daemon=True).start()
+
+    def child_exited():
+        lines.put((None, child.wait()))
+
+    threading.Thread(target=child_exited, daemon=True).start()
     try:
         ended = 0
         while ended < 2:
             is_stderr, line = lines.get()
+            if is_stderr is None:
+                # Descendants may hold RPC pipes after the leader has exited.
+                close_input()
+                terminate_group()
+                continue
             if line is None:
                 ended += 1
                 continue
@@ -88,9 +110,16 @@ def main():
             if event.get("type") in ("piccolo_worker_ready", "piccolo_worker_closed", "piccolo_worker_error"):
                 startup.cancel()
                 print(json.dumps(event), flush=True)
+            if event.get("type") == "piccolo_worker_ready":
+                ready.set()
+            if event.get("type") == "piccolo_worker_closed":
+                service_closed.set()
+            if event.get("type") == "piccolo_worker_error":
+                failed.set()
             if event.get("type") in ("piccolo_worker_closed", "piccolo_worker_error"):
                 close_input()
-        return child.wait()
+        result = child.wait()
+        return result if result else 1 if failed.is_set() or not ready.is_set() or not service_closed.is_set() else 0
     finally:
         startup.cancel()
         close_input()
@@ -98,14 +127,28 @@ def main():
             try:
                 child.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                signal_group(signal.SIGTERM)
+                terminate_group()
                 try:
                     child.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     signal_group(signal.SIGKILL)
                     child.wait()
+        terminate_group()
         for timer in timers:
             timer.cancel()
+        # Pipe EOF and a reaped leader say nothing about descendants whose
+        # streams were redirected. Finish cleanup of our owned process group
+        # synchronously before returning, even if the leader-exit event lost
+        # the race to both EOF notifications.
+        while True:
+            try:
+                os.killpg(child.pid, 0)
+            except ProcessLookupError:
+                break
+            if time.monotonic() >= termination_deadline:
+                signal_group(signal.SIGKILL)
+                break
+            time.sleep(.02)
 
 
 if __name__ == "__main__":

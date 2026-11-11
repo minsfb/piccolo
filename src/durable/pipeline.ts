@@ -56,6 +56,8 @@ export function createPipelineTasks(stage: ReturnType<typeof createStageTask>, w
         await api.commit(() => ({ status: "running", checkpoint: { phase: "preparing" } }), ctx);
         try {
           const work = structuredClone(node.work);
+          if (work.kind === "delegate" && selectWorktreePath(work.root, work.branch, work.cwd) !== work.cwd)
+            throw new Error("Pipeline worktree path must be canonical before any preparation probe");
           prepareExperimentParent(work.kind === "delegate" ? work.root : work.workflow.root, work.kind === "delegate" ? work.cwd : work.workflow.worktree);
           if (work.kind === "delegate") {
             const destination = preflightWorktree(work.root, work.cwd, work.branch);

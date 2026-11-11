@@ -4,7 +4,7 @@ import { Harness, createRegistry } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { z } from "zod";
-import { JobsDoc } from "./worker.ts";
+import { readAdmissions } from "./admissions.ts";
 import { SupervisorDoc } from "./supervisor.ts";
 import { openWorkerStorage } from "./storage.ts";
 import { managedModels } from "./models.ts";
@@ -17,7 +17,7 @@ import { recoveryNoticeDismissed } from "./recovery-notices.ts";
 
 export type RecoveryJob = { id: string; kind: string; owner: string; lifetime: string; host: string; state: string;
   terminal: boolean; availability: "available" | "unavailable" | "unchecked"; reason?: string; remote?: RemoteWorker;
-  attention?: Array<{ id: string; question: string; stage: string }>; result?: unknown; hostName?: string; parentReview?: string; outcomeRevision?: string; unresolvedRemote?: boolean; dismissed?: boolean };
+  attention?: Array<{ id: string; question: string; stage: string }>; result?: unknown; hasResult?: boolean; cancellationError?: string; hostName?: string; parentReview?: string; outcomeRevision?: string; unresolvedRemote?: boolean; dismissed?: boolean };
 export type RecoveryInventory = { session: string; jobs: RecoveryJob[]; independent: RecoveryJob[]; error?: string };
 export function localWorkerDirectory(root: string, session: string) {
   if (!session || /[\\/]/.test(session) || [".", ".."].includes(session)) throw new Error("Invalid worker session identity");
@@ -39,7 +39,7 @@ export async function discoverJobs(root: string, session: string, ctx: Extension
       const store = await openWorkerStorage(directory, workspace); release = store.release;
       try { harness = await Harness.open(store.storage, { registry: createRegistry(), models: managedModels(ctx.modelRegistry) }, context); }
       catch (error) { await store.storage.close(context); throw error; }
-      const admissions = (await harness.snapshot(JobsDoc, context))?.requests ?? {};
+      const admissions = await readAdmissions(harness, context);
       const graph = (await harness.inspect(context)).tasks.map(item => item.record);
       const questions = (await harness.snapshot(SupervisorDoc, context))?.requests ?? {};
       const decisions = (await harness.snapshot(Decisions, context))?.decisions ?? {};
@@ -62,12 +62,14 @@ export async function discoverJobs(root: string, session: string, ctx: Extension
         const missingModel = liveStages.find(item => { const ref = (item.input as any).spec?.model; return ref && !ctx.modelRegistry.find(ref.provider, ref.modelId); });
         inventory.jobs.push({ id, kind: admission.input.kind, owner: session, lifetime: admission.input.lifetime,
           host: admission.input.placement?.workspace.host ?? admission.input.workspace.host,
-          state: terminal ? outcome?.result?.status ?? outcome?.status : attention.length ? "needs_parent" : "suspended",
+          state: terminal || admission.cancellationError ? projection.state : attention.length ? "needs_parent" : "suspended",
           terminal, availability: !admission.input.placement && (missing || missingModel) ? "unavailable" : "unchecked", remote: admission.input.placement, attention,
           parentReview: decisions[id] && projection.revision && decisions[id].revision === projection.revision ? decisions[id].disposition : terminal ? "pending" : "not_ready",
           outcomeRevision: projection.revision,
+          cancellationError: admission.cancellationError, hasResult: projection.result !== undefined,
           unresolvedRemote: !!admission.input.placement && terminal && ["faulted", "failed"].includes(outcome?.status) && outcome?.result?.status !== "rejected",
-          ...(outcome ? { result: outcome.result, reason: projection.error } : {}),
+          ...(outcome ? { result: outcome.result } : {}),
+          ...(projection.error ? { reason: projection.error } : {}),
           ...(!admission.input.placement && (missing || missingModel) ? { reason: missing ? "Saved stage working directory is no longer available" : "Saved stage model is no longer registered on this host" } : {}) });
       }
     } catch (error) { inventory.error = String(error).slice(0, 1000); }
@@ -76,7 +78,10 @@ export async function discoverJobs(root: string, session: string, ctx: Extension
   const dispatch = path.join(root, ".cache", "piccolo", "dispatch");
   if (fs.existsSync(dispatch)) {
     const stat = fs.lstatSync(dispatch);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Invalid retained dispatch directory");
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(dispatch) !== path.resolve(dispatch)) {
+      inventory.error = [inventory.error, "Invalid retained dispatch directory; restore its original real path before reconnecting."].filter(Boolean).join("; ");
+      return inventory;
+    }
     for (const name of fs.readdirSync(dispatch).filter(name => /^[a-f0-9-]{36}\.json$/.test(name)).slice(0, 1000)) {
       const file = path.join(dispatch, name), stat = fs.lstatSync(file);
       if (!stat.isFile() || stat.size > 9 * 1024 * 1024) continue;
@@ -113,12 +118,12 @@ export async function probeJobs(inventory: RecoveryInventory, root?: string, lim
       const status = await workerRequest(job.remote, { operation: "inspect", requestId: job.id }, undefined, timeoutMs);
       job.availability = "available"; job.attention = status.attention;
       if (status.task?.state.status === "terminal") {
-        const revision = outcomeProjection(status.task.state.outcome).revision;
+        const projected = outcomeProjection(status.task.state.outcome, undefined, job.cancellationError), revision = projected.revision;
         if (revision !== job.outcomeRevision) job.parentReview = "pending";
         job.outcomeRevision = revision;
-        job.terminal = true; job.state = status.task.state.outcome?.result?.status ?? status.task.state.outcome?.status; job.result = status.task.state.outcome?.result;
+        job.terminal = true; job.state = projected.state; job.result = projected.result; job.hasResult = projected.result !== undefined; job.reason = projected.error;
         if (root) try { cacheDispatchState(root, job.remote, job.id, "terminal", status.task.state.outcome); } catch { /* Advisory cache only. */ }
-      } else { job.terminal = false; job.state = status.attention?.length ? "needs_parent" : "running"; }
+      } else { job.terminal = false; job.state = job.cancellationError ? "unresolved" : status.attention?.length ? "needs_parent" : "running"; job.parentReview = "not_ready"; job.outcomeRevision = undefined; job.result = undefined; job.hasResult = false; }
     } catch (error) { job.availability = "unavailable"; job.reason = `Remote work may still exist. ${String(error).slice(0, 700)}`; }
   };
   for (let offset = 0; offset < candidates.length; offset += 4) await Promise.all(candidates.slice(offset, offset + 4).map(probe));

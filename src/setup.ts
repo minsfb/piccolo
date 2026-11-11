@@ -32,6 +32,7 @@ export function setupPlan(options: Options = {}) {
   const wanted = [ { name: "piccolo", version: JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version, source: packageRoot },
     { name: "pi-subagents", version: "0.79.2", source: "npm:pi-subagents@0.79.2" },
     { name: "pi-harness-health", version: JSON.parse(fs.readFileSync(path.join(packageRoot, "packages/health/package.json"), "utf8")).version, source: path.join(packageRoot, "packages/health") },
+
     ...(options.blackhole ? [{ name: "pi-blackhole", version: "0.5.15", source: "npm:pi-blackhole@0.5.15" }] : []) ];
   for (const entry of wanted) {
     for (const installed of present.filter((p: any) => p.name === entry.name)) {

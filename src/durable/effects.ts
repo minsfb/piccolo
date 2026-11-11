@@ -1,7 +1,11 @@
 import type { Context } from "@earendil-works/chord/context";
-import type { ConversationId, Tx, ToolRegistration } from "@earendil-works/pi-durable";
+import { defineDoc, type ConversationId, type EntryId, type Tx, type ToolRegistration } from "@earendil-works/pi-durable";
 
 const unknownEffect = "piccolo.unknown-effect";
+export const EffectProjection = defineDoc<{ checkedThrough: EntryId | null; marker: EntryId | null; uncertain: boolean }>({
+  kind: "piccolo.effect-projection", version: 1, scope: "conversation", history: "latest", fork: "initial",
+  initial: () => ({ checkedThrough: null, marker: null, uncertain: false }),
+});
 
 function isUnknown(error: unknown) {
   const seen = new Set<object>();
@@ -17,15 +21,22 @@ function isUnknown(error: unknown) {
 export async function hasUncertainEffects(session: { commit(read: (tx: Tx) => Promise<undefined>, context: Context): Promise<unknown> }, conversationId: ConversationId, context: Context) {
   let uncertain = false;
   await session.commit(async tx => {
+    const projection = await tx.doc(EffectProjection, conversationId);
+    const marker = (await tx.latestHeadMarker(conversationId))?.id ?? null;
+    // A changed context boundary or fork must never trust another history's cursor.
+    if (projection.marker !== marker) { projection.checkedThrough = null; projection.uncertain = false; projection.marker = marker; }
+    if (projection.uncertain) { uncertain = true; return undefined; }
+    const minimum = projection.checkedThrough;
     let cursor;
     do {
-      const page = await tx.scanEntries({ conversationId }, 1000, cursor);
+      const page = await tx.scanEntries({ conversationId, order: "ascending", ...(minimum !== null ? { minEntryId: minimum } : {}) }, 1000, cursor);
       uncertain = page.items.some(entry => entry.kind === "pi.tool-result" &&
         (entry.data as { diagnostics?: { code?: string }[] } | undefined)?.diagnostics?.some(
           // Upstream's aborted receipt does not say whether execution began or
           // whether the tool was replay-safe. Conservatively require reconciliation.
           diagnostic => diagnostic.code === "interrupted" || diagnostic.code === "aborted" || diagnostic.code === unknownEffect));
-      if (uncertain) break;
+      if (page.items.length) projection.checkedThrough = page.items.at(-1)!.id;
+      if (uncertain) { projection.uncertain = true; break; }
       cursor = page.next;
     } while (cursor);
     return undefined;

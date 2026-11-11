@@ -57,6 +57,8 @@ is selected with `[background] executor = "native"`. Dependencies pin Pi SDK 1.3
 compatibility with other installed Pi releases must be assessed separately.
 Runtime compatibility patches are opt-in, and no historical live qualification
 is asserted for your installation.
+The [native completion admission prototype](docs/native-turn-admission.md) is
+awaiting upstream acceptance and a compatible release.
 
 ## Layout
 

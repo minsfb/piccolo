@@ -6,9 +6,9 @@ import type { AgentChange } from "@earendil-works/pi-durable";
 import { MessagesDoc } from "./messages.ts";
 import { StageOwner, type StageResources } from "./pool.ts";
 import { hasUncertainEffects } from "./effects.ts";
-import type { Context } from "@earendil-works/chord/context";
+import { withCancel, type Context } from "@earendil-works/chord/context";
 
-export type StageResult = { status: "complete" | "needs_parent"; text: string; conversationId: number; provenance?: { requested: StageSpec["model"]; observed: string[]; effort: string }; metrics?: { usage: Record<string, number | null> | null; source: string } };
+export type StageResult = { status: "complete" | "needs_parent"; text: string; conversationId: number; reason?: string; provenance?: { requested: StageSpec["model"]; observed: string[]; effort: string }; metrics?: { usage: Record<string, number | null> | null; source: string } };
 type Input = { spec: StageSpec; cwd: string };
 type Checkpoint = { phase: "create" } | { phase: "queued"; active: TaskId[] } | { phase: "acquire" } |
   { phase: "run"; conversationId: ConversationId; deadline: number; correction?: number };
@@ -16,7 +16,7 @@ type Checkpoint = { phase: "create" } | { phase: "queued"; active: TaskId[] } | 
 export function stageActivity(task: { state: { status: string; checkpoint?: unknown } }): "waiting" | "starting" | "active" {
   const phase = (task.state.checkpoint as { phase?: string } | undefined)?.phase;
   return phase === "queued" || task.state.status === "waiting" ? "waiting" :
-    phase === "acquire" || task.state.status === "pending" ? "starting" : "active";
+    phase === "create" || phase === "acquire" || task.state.status === "pending" ? "starting" : "active";
 }
 
 /** One owned conversation per stage; stable input IDs reconcile lost submit replies. */
@@ -49,7 +49,11 @@ export function createStageTask(agent: (spec: StageSpec, cwd: string) => AgentCh
       async queued(task, api, ctx) {
         // The persisted queue owns no conversation or host lease. Wake after
         // any reservation settles, then recheck capacity on the mutation line.
-        if (task.state.checkpoint.active.length) await Promise.race(task.state.checkpoint.active.map(id => api.waitForTask(id, ctx)));
+        if (task.state.checkpoint.active.length) {
+          const round = withCancel(ctx), waits = task.state.checkpoint.active.map(id => api.waitForTask(id, round.context));
+          try { await Promise.race(waits); }
+          finally { round.cancel(); await Promise.allSettled(waits); }
+        }
         await api.commit(() => ({ status: "running", checkpoint: { phase: "create" } }), ctx);
       },
       async acquire(task, api, ctx) {
@@ -94,6 +98,16 @@ export function createStageTask(agent: (spec: StageSpec, cwd: string) => AgentCh
           // Inspect committed history so a summary cannot erase an unsafe receipt.
           const uncertain = await hasUncertainEffects(api, conversationId, ctx);
           let status: StageResult["status"] = settled.status === "done" && !uncertain && !timeout.signal.aborted ? "complete" : "needs_parent";
+          let reason = uncertain ? "Uncertain tool effect requires parent reconciliation" : timeout.signal.aborted ? "Stage deadline exceeded" :
+            settled.status !== "done" ? `Stage input settled as ${settled.status}` : undefined;
+          if (settled.status !== "done") await api.commit(async tx => {
+            const failures = (await tx.scanTasks({ conversationId, status: "terminal" }, 1000)).items
+              .filter(record => record.state.status === "terminal" && "error" in record.state.outcome)
+              .sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0));
+            const error = failures[0]?.state.status === "terminal" ? (failures[0].state.outcome as { error?: { message?: string } }).error?.message : undefined;
+            if (error && !uncertain && !timeout.signal.aborted) reason = error.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 1000);
+            return undefined;
+          }, ctx);
           if (task.input.spec.report) {
             try { if (parseReport(text).status !== "complete") status = "needs_parent"; }
             catch {
@@ -116,7 +130,7 @@ export function createStageTask(agent: (spec: StageSpec, cwd: string) => AgentCh
             turns: ownMessages.length, toolCalls: ownMessages.reduce((sum, message) => sum + message.content.filter(part => part.type === "toolCall").length, 0),
             cost: ownMessages.reduce((sum, message) => sum + message.usage.cost.total, 0), durationMs: task.input.spec.timeoutMs - (deadline - api.now()),
           } : null;
-          await api.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { status, text, conversationId,
+          await api.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { status, text, conversationId, ...(reason ? { reason } : {}),
             provenance: { requested: task.input.spec.model, observed, effort: task.input.spec.thinkingLevel }, metrics: { usage, source: "durable_conversation_reported" } } } }), ctx);
         } finally { clearTimeout(timer); timeout.signal.removeEventListener("abort", abort); }
       },

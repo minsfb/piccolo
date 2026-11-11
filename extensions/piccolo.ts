@@ -200,8 +200,12 @@ export default async function piccolo(pi: ExtensionAPI) {
   register({ name: "piccolo_inspect", label: "Explain Piccolo configuration", description: "Show effective configuration and origins, including packages contributed in this Pi session. Optional JSON Pointer or agent type resolves a focused view. Does not change selection or materialize configuration.",
     parameters: Type.Object({ pointer: Type.Optional(Type.String()), type: Type.Optional(Type.String()) }),
     async execute(_id, params, _signal, _update, ctx) {
-      const result = inspectConfig(loadConfig(projectRoot(ctx.cwd), { contributions }), params.pointer, params.type);
-      return response({ ...result, scope: "Current Pi session contributions plus files; runtime model availability remains a launch check." });
+      const resolved = loadConfig(projectRoot(ctx.cwd), { contributions });
+      const result = inspectConfig(resolved, params.pointer, params.type);
+      const policyRequired = process.env.PICCOLO_REQUIRE_WORKER_POLICY === "1";
+      return response({ ...result, worker_readiness: { policy_required: policyRequired, policy_configured: !!resolved.config.integration?.worker_policy,
+        state: policyRequired && !resolved.config.integration?.worker_policy ? "required_policy_unavailable" : "configuration_present; runtime_checks_pending" },
+        scope: "Current Pi session contributions plus files; runtime model availability remains a launch check." });
     },
   });
   register({ name: "piccolo_remote", label: "Explicit remote job", description: "Reconnect to an explicitly assigned Durable worker by ID to inspect, message or stop it; messages require a stable UUID message_id. Start typed Durable work with piccolo_submit. Legacy hosts support native start/status. Never selects a host automatically. Status does not replay work; unresolved means no terminal receipt, not proof the worker is alive. Remote cwd/packages must already be provisioned. Native completion is not a task correctness verdict.",
@@ -489,8 +493,8 @@ export default async function piccolo(pi: ExtensionAPI) {
     return {
       settings: host ? { ...submittedResolved.config.background, executor: "durable" } : submittedResolved.config.background,
       ...(target ? { target: { workspace: { host: target.hostname, cwd: target.cwd, identity: target.worker_identity! }, transport: target.worker_transport! } } : {}),
-      snapshot: { kind, arguments: inputs, resolved: submittedResolved, agents, configs, parent: { model: model ? `${model.provider}/${model.id}` : undefined, effort, cwd: fs.realpathSync(ctx.cwd) }, context_digest: digest(shared), context_messages: shared.length,
-        ...((host || submittedResolved.config.background?.executor === "durable") ? { context: shared.map(message => message.role === "system" ? { role: message.role, content: message.content, timestamp: message.timestamp } : message) } : {}),
+      snapshot: { kind, arguments: inputs, resolved: submittedResolved, agents, parent: { model: model ? `${model.provider}/${model.id}` : undefined, effort, cwd: fs.realpathSync(ctx.cwd) }, context_digest: digest(shared), context_messages: shared.length,
+        ...((host || (submittedResolved.config.background?.executor ?? "durable") === "durable") ? { configs, context: shared.map(message => message.role === "system" ? { role: message.role, content: message.content, timestamp: message.timestamp } : message) } : {}),
         schedule, experiment, experimentBase },
       execute: async execution => {
         if (schedule && digest(readSchedule(root)) !== digest(schedule)) throw new Error("Schedule changed after submission");

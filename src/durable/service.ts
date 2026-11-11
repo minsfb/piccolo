@@ -21,7 +21,8 @@ export async function serveWorker(worker: DurableWorker, workspace: Workspace, s
       for await (const chunk of request) { size += chunk.length; if (size > 8 * 1024 * 1024) throw new Error("Worker request exceeds 8 MiB"); chunks.push(chunk); }
       const value = workerRequestSchema.parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
       if (closing) throw new Error("Worker is closing");
-      if (value.workspace && digest(value.workspace) !== digest(workspace)) throw new Error("Worker workspace identity mismatch");
+      if (digest(value.workspace) !== digest(workspace)) throw new Error("Worker workspace identity mismatch");
+      submittedId = value.operation === "submit" ? value.submission.requestId : "requestId" in value ? value.requestId : undefined;
       let result: unknown;
       switch (value.operation) {
         case "info": {
@@ -29,7 +30,7 @@ export async function serveWorker(worker: DurableWorker, workspace: Workspace, s
           let worktreeOwner: string | null = null;
           try { head = git(workspace.cwd, "rev-parse", "HEAD"); } catch { /* Delegates may use a workspace without Git. */ }
           try { worktreeOwner = owningRepository(workspace.cwd); } catch { /* Unusual layouts need an explicit worktree destination. */ }
-          result = { version: 1, registry: "piccolo-1", workspace, head, worktreeOwner, pid: process.pid, capabilities: worker.capabilities(), runtime: "pi-durable/1.3.0", env: "pi-env/1.3.0" }; break;
+          result = { version: 1, registry: "piccolo-1", workspace, head, worktreeOwner, pid: process.pid, protocol: { watch: true }, capabilities: worker.capabilities(), runtime: "pi-durable/1.3.0", env: "pi-env/1.3.0" }; break;
         }
         case "submit": submittedId = value.submission.requestId; const admission = await worker.submit(value.submission); result = { taskId: admission.taskId, fingerprint: admission.fingerprint }; break;
         case "assess": result = await assessTrial(worker, value.requestId, value.assessment); break;

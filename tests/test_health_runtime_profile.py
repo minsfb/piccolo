@@ -34,7 +34,16 @@ class RuntimeProfileTests(unittest.TestCase):
                        lambda p: p['descriptors']['_startRun'].update(configurable=False),
                        lambda p: p.update(missing=['bound.checkAuth']),
                        lambda p: p.update(prototype_extensible=False)]:
-            value = profile('1.4.0', capture.CLEANUP_METHODS)
+            value = profile('1.4.0', capture.PI_140_METHODS)
+            change(value)
+            self.assertFalse(capture.validate_profile(value))
+
+    def test_cleanup_capture_rejects_wrong_types_hashes_and_descriptor_kinds(self):
+        for change in [lambda p: p.update(format=True), lambda p: p.update(qualified=True),
+                       lambda p: p['hashes'].update(_emitAgentSettled='z' * 64),
+                       lambda p: p['boundHashes'].update(checkAuth='a' * 63),
+                       lambda p: p['descriptors']['_resolveIdleWaitIfIdle'].update(kind='getter')]:
+            value = profile('1.4.0', capture.PI_140_METHODS)
             change(value)
             self.assertFalse(capture.validate_profile(value))
 

@@ -26,7 +26,7 @@ export type Execution = Task & { base: string };
 export type ExecutionResult = { status: string; candidate: string; branch: string; worktree: string; record: string };
 export type Executor = (task: Execution, signal: AbortSignal) => Promise<ExecutionResult>;
 
-function safe(root: string, relative: string, create = false) {
+export function safeSchedulerPath(root: string, relative: string, create = false) {
   let current = root;
   for (const part of relative.split(path.sep)) {
     if (!part || part === "." || part === "..") throw new Error("Invalid scheduler record path");
@@ -37,6 +37,7 @@ function safe(root: string, relative: string, create = false) {
   }
   return current;
 }
+const safe = safeSchedulerPath;
 function read(file: string) {
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {

@@ -33,6 +33,7 @@ test("current-session opt-out and version mismatch cannot reuse a process adapte
       handlers.get("session_start")({}, context);
       assert.equal(hasParentWake(context), true, "process adapter still exists");
       assert.equal(health.facts().wake_capability, false);
+      assert.equal(health.facts().wake_unavailable_reason, compatibility === "off" ? "managed_compatibility_disabled" : "runtime_version_mismatch");
       assert.equal(claim(), false);
       await health.tick(); clock += 2000; await health.tick();
       assert.equal(calls, 0, "no inference through a disallowed managed adapter");

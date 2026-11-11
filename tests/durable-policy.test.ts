@@ -10,6 +10,7 @@ import { MemoryStorage, defineTool } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { NativePolicy, NativePolicyDoc } from "../src/durable/native-policy.ts";
 import { DurableWorker } from "../src/durable/worker.ts";
+import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
 
 async function fixture(source: string, answer: (context: Context) => string | ToolCall | ToolCall[], execute = async (_args: any, _api?: any, _context?: any) => ({ output: [{ type: "text" as const, text: "original" }] })) {
   const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "piccolo-policy-")));
@@ -105,6 +106,49 @@ test("request receipts follow changed transcripts and pending policy effects sto
   } finally { await f.close(); }
 });
 
+// #38 A-11: terminal conversations cannot grow a process-long policy cache.
+test("policy runners are evicted when their owning stage becomes terminal", async () => {
+  const f = await fixture(`export default pi => pi.on('before_agent_start', () => undefined);`, () => "done");
+  try {
+    for (let i = 0; i < 8; i++) {
+      const request = f.request(); await f.worker.submit(request); await f.worker.wait(request.requestId);
+      assert.equal(f.policy.capabilities().cachedRunners, 0);
+    }
+  } finally { await f.close(); }
+});
+
+// #38 A-11: a transient constructor failure is not a permanent rejected promise.
+test("a failed policy runner creation can retry with unchanged qualified sources", async () => {
+  const f = await fixture(`export default pi => pi.on('before_agent_start', () => ({message:{customType:'rule',content:'RECOVERED_RULE',display:false}}));`, () => "done");
+  const reload = DefaultResourceLoader.prototype.reload; let fail = true;
+  DefaultResourceLoader.prototype.reload = async function(...args) {
+    if (fail) { fail = false; throw new Error("Transient fixture loader failure"); }
+    return reload.apply(this, args);
+  };
+  try {
+    const request = f.request(); await f.worker.submit(request); const result = await f.worker.wait(request.requestId);
+    const conversationId = (result.state.outcome as any).result.conversationId;
+    assert.equal(f.policy.capabilities().cachedRunners, 0);
+    const recovered = await f.policy.beforeRequest([{role:"user",content:"retry",timestamp:1}], {conversationId,taskId:999} as any, BACKGROUND_CONTEXT);
+    assert.match(JSON.stringify(recovered), /RECOVERED_RULE/);
+    assert.equal(f.policy.capabilities().cachedRunners, 0);
+  } finally { DefaultResourceLoader.prototype.reload = reload; await f.close(); }
+});
+
+// #38 pipeline F11: normalized execution arguments share one original receipt key.
+test("native argument coercion cannot cause a receipted tool to execute twice", async () => {
+  const f = await fixture(`export default pi => pi.on('tool_result', () => undefined);`, () => "done"); let effects = 0;
+  try {
+    const request = f.request(); await f.worker.submit(request); const result = await f.worker.wait(request.requestId);
+    const api = { conversationId: (result.state.outcome as any).result.conversationId, taskId: 888, callId: "coercion-case" } as any;
+    const tool = f.policy.wrap(defineTool({ name: "count", description: "Owned count fixture", parameters: Type.Object({ count: Type.Number() }), replay: "safe", execute: async args => {
+      effects++; assert.equal(args.count, 7); return { output: [{ type: "text", text: "counted" }] };
+    } }));
+    await tool.execute({ count: "7" }, api, BACKGROUND_CONTEXT); await tool.execute({ count: "7" }, api, BACKGROUND_CONTEXT);
+    assert.equal(effects, 1);
+  } finally { await f.close(); }
+});
+
 test("notification-only compaction resets run once and native metadata consumers reject", async () => {
   for (const inspectMetadata of [false, true]) {
     const f = await fixture(`import fs from 'node:fs'; export default pi => pi.on('session_before_compact', (e,ctx) => {
@@ -170,6 +214,26 @@ test("shell identity preparation waits for a parallel policy callback", { timeou
   } finally { fs.writeFileSync(path.join(f.directory, 'release-callback'), 'yes'); await f.close(); }
 });
 
+
+test("policy source drift during native resource loading prevents model execution", async () => {
+  let calls = 0;
+  const f = await fixture(`export default pi => pi.on('before_agent_start', () => undefined);`, () => { calls++; return "done"; });
+  const reload = DefaultResourceLoader.prototype.reload;
+  DefaultResourceLoader.prototype.reload = async function (...args: Parameters<typeof reload>) {
+    await reload.apply(this, args);
+    fs.appendFileSync(path.join(f.directory, "policy.mjs"), "\n// Changed after loading\n");
+  };
+  try {
+    const request = f.request(); await f.worker.submit(request); const outcome: any = (await f.worker.wait(request.requestId)).state.outcome;
+    assert.equal(outcome.result.status, "needs_parent");
+    assert.match(outcome.result.reason, /Native policy source changed/);
+    const graph = await f.worker.harness.commit(tx => tx.scanTasks({ conversationId: outcome.result.conversationId }, 1000), BACKGROUND_CONTEXT);
+    const transcript = await f.worker.harness.commit(tx => tx.scanEntries({ conversationId: outcome.result.conversationId }, 1000), BACKGROUND_CONTEXT);
+    const errors = JSON.stringify({ graph, transcript });
+    assert.match(errors, /Native policy source changed/);
+    assert.equal(calls, 0);
+  } finally { DefaultResourceLoader.prototype.reload = reload; await f.close(); }
+});
 
 test("a new stage rejects policy source drift before any model request", async () => {
   let calls = 0;

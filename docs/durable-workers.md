@@ -48,3 +48,29 @@ See [worker contract](contract-v2.md), [validation receipts](validation-receipts
 [pipeline testing](testing-durable-pipelines.md). Regression tests exercise
 synthetic workers and fixtures; users must separately qualify their live runtime,
 provider modules, and remote supervision.
+
+## Retained state and cancellation
+
+The Jobs index is version 2, with immutable per-Job input documents. Normal
+worker opening migrates older inline inputs; cancellation-only recovery retains
+their original layout. Older workers cannot read the new index. Upgrade workers
+before using new task phases, and retain the original runtime and policy needed
+to reconcile saved work.
+
+Saved generations remain suspended until explicit resume or whole-generation
+cancellation. Attached independent Jobs require `include_independent=true` for
+whole-generation cancellation. A single stop does not authorize unrelated saved
+work to execute. If adopting a verified remote result needs scheduling, that
+adoption remains deferred until a whole-generation decision; the native record
+and retained receipt are preserved.
+
+Cancellation errors remain visible until a confirmed retry. Outcomes and parent
+decisions use exact revisions across live status, recovery and admission
+accounting. A newer recovered result requires fresh inspection and acknowledgment.
+Lost transport replies or missing remote tasks retain uncertainty and the original
+assignment; they do not authorize duplicate submission.
+
+Queued stages release losing wait registrations without cancelling busy stages.
+Required pipeline checks must have passing receipts for the exact candidate;
+optional checks cannot replace them. Native policy revisions cover imported
+dependencies as well as explicitly checked entrypoints.

@@ -23,6 +23,64 @@ test("strict manifest fixes criteria and balances repeated variant order", () =>
   const m: any = manifest(); m.tasks.read.kind = "workflow"; assert.throws(() => planExperiment(m));
   assert.equal(experimentTrialArguments(plan, plan.trials[0], "/work", "b", "sha").task, "Read input");
 });
+
+// #30: raw trial storage must be ignored before preparation writes anything.
+test("experiment storage rejects missing and negated ignore coverage before mutation", async () => {
+  for (const ignore of ["/.pi/\n/.worktrees/\n", "/.pi/\n/.worktrees/\n.cache/piccolo/experiments/*/*.json\n.cache/piccolo/experiments/*/*/*.json\n!.cache/piccolo/experiments/*/001/outcome.json\n"]) {
+    const root = fixture();
+    try {
+      const excludes = path.join(root, ".git", "fixture-excludes");
+      fs.writeFileSync(excludes, ""); git(root, "config", "core.excludesFile", excludes);
+      fs.writeFileSync(path.join(root, ".gitignore"), ignore);
+      git(root, "add", ".gitignore"); git(root, "commit", "-m", "selected ignore coverage");
+      let calls = 0;
+      await assert.rejects(runExperiment(root, planExperiment(manifest()), {}, async () => { calls++; return good(); }), /Ignore.*artifact paths/);
+      assert.equal(calls, 0);
+      assert.equal(fs.existsSync(path.join(root, ".cache")), false);
+      assert.equal(fs.existsSync(path.join(root, ".worktrees")), false);
+      assert.equal(fs.readFileSync(path.join(root, ".gitignore"), "utf8"), ignore);
+      assert.equal(git(root, "status", "--porcelain"), "");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+// #31: references share native configuration syntax, while owned IDs stay path-safe.
+test("experiments accept namespaced agent and job references through execution arguments", async () => {
+  for (const kind of ["delegate", "workflow"] as const) {
+    const root = fixture();
+    try {
+      const reference = "my-team:" + "r".repeat(64);
+      const m: any = manifest();
+      m.tasks.read = kind === "delegate"
+        ? { kind, type: reference, task: "Read input", criterion: { kind: "exact_text", expected: "fixture" } }
+        : { kind, job: reference, task: "Read input", criterion: { kind: "required_checks" }, checks: { verify: { command: "node --version", cwd: ".", boundary: "isolated", scope: "owned fixture runtime", required: true, timeout_ms: 1000 } } };
+      const plan = planExperiment(m); let calls = 0;
+      await runExperiment(root, plan, {}, async (trial, workspace, branch, base) => {
+        const args: any = experimentTrialArguments(plan, trial, workspace, branch, base);
+        assert.equal(kind === "delegate" ? args.type : args.job, reference);
+        calls++; return kind === "delegate" ? good() : { status: "complete", result: { qualification: "checks_passed" }, provenance: {} };
+      });
+      assert.equal(calls, 4);
+      assert.throws(() => planExperiment({ ...m, name: "my-team:owned-id" }));
+      assert.throws(() => planExperiment({ ...m, variants: { "my-team:variant": {} } }));
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+// #38 PIC-GPT-001: preparation must not silently add uncommitted source inputs.
+test("experiment source is rechecked after preparing a previously absent ignore file", async () => {
+  const root = fixture();
+  try {
+    fs.unlinkSync(path.join(root, ".gitignore")); git(root, "add", ".gitignore"); git(root, "commit", "-m", "use repository-local runtime exclusions");
+    fs.writeFileSync(path.join(root, ".git", "info", "exclude"), "/.cache/\n/.pi/\n/.worktrees/\n");
+    let calls = 0;
+    await assert.rejects(runExperiment(root, planExperiment(manifest()), {}, async () => { calls++; return good(); }), /untracked inputs created during worktree preparation/);
+    assert.equal(calls, 0);
+    assert.equal(fs.existsSync(path.join(root, ".cache")), false);
+    assert.equal(fs.readFileSync(path.join(root, ".gitignore"), "utf8"), "/.worktrees/\n");
+    assert.match(git(root, "status", "--porcelain"), /\?\? \.gitignore/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 test("all planned trials remain denominators; command completion is not quality", async () => {
   const root = fixture();
   try {

@@ -6,7 +6,7 @@ import { defineDoc } from "@earendil-works/pi-durable";
 import { digest } from "../config.ts";
 import { evaluateRoadmap, roadmapSchema } from "../roadmap.ts";
 import { git, requireCandidate } from "../workflow.ts";
-import { acquireScheduleLock } from "../scheduler.ts";
+import { acquireScheduleLock, safeSchedulerPath } from "../scheduler.ts";
 import { sourceDigest } from "./pipeline.ts";
 import type { DurableWorker } from "./worker.ts";
 
@@ -22,7 +22,7 @@ export async function exportRoadmap(worker: DurableWorker, requestId: string) {
   if (task?.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("Inspect and reconcile the incomplete schedule before exporting");
   const result = task.state.outcome.result as any;
   if (!result?.results) throw new Error("Schedule has no settled node results");
-  const root = input.workspace.cwd, file = path.join(root, ".piccolo", "roadmap.json");
+  const root = input.workspace.cwd, file = safeSchedulerPath(root, ".piccolo/roadmap.json");
   const controller = new AbortController();
   const release = await acquireScheduleLock(root, controller);
   const checkOwner = () => { if (controller.signal.aborted) throw new Error("Schedule export lock lost"); };
@@ -64,14 +64,16 @@ export async function exportRoadmap(worker: DurableWorker, requestId: string) {
     if (current === intent.before) {
       const temporary = path.join(path.dirname(file), `.${randomUUID()}.tmp`);
       try {
-        fs.writeFileSync(temporary, intent.bytes, { flag: "wx", mode: 0o600 });
+        safeSchedulerPath(root, ".piccolo/roadmap.json");
+        const mode = fs.statSync(file).mode & 0o777;
+        fs.writeFileSync(temporary, intent.bytes, { flag: "wx", mode }); fs.chmodSync(temporary, mode);
         if (sourceDigest(file) !== intent.before) throw new Error("Roadmap changed during export");
         checkOwner(); fs.renameSync(temporary, file);
       } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
     }
     for (const [id, node] of Object.entries(result.results) as Array<[string, any]>) {
       const attempt = input.pipeline.nodes[id].attempt ?? 1;
-      const home = path.join(root, ".piccolo", "schedules", digest({ task: id, attempt }));
+      const home = safeSchedulerPath(root, `.piccolo/schedules/${digest({ task: id, attempt })}`);
       const outcome = { format: 1, task: id, status: node.status === "complete" ? "complete" : "blocked", result: node.result, durable_request: requestId };
       const destination = path.join(home, "outcome.json"), temporary = path.join(home, `.${randomUUID()}.tmp`);
       try {

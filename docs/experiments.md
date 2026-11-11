@@ -50,8 +50,9 @@ there is no resume, retry, cleanup or automatic replay API.
 
 ## Workflows and criteria
 
-This initial release accepts simple unnamespaced agent/job references; native
-namespaced references are not part of this interface.
+Agent `type` and workflow `job` references use native configuration names,
+including namespaced references such as `team:reviewer`. Experiment, task and
+variant names remain bounded, path-safe identifiers.
 
 A workflow task sets `kind = "workflow"`, optional `job` and `max_revisions`, and
 explicit `[tasks.NAME.checks.CHECK]` entries with the existing command/cwd/boundary/
@@ -70,9 +71,12 @@ the same base in a distinct branch; no candidate is pushed or merged into the pa
 Worktree isolation separates source changes, not network credentials or host services.
 Task/check permissions follow the existing project and harness execution boundary.
 Use an onboarded project with `.cache/` and the owning `.worktrees/` ignored.
-Commit intended ignore changes before freezing experiment source. Directly configured projects must
-check their ignore coverage before running; explicit experiment-storage preflight
-is not inferred from experiment success.
+Commit intended ignore changes before freezing experiment source. Native experiment
+execution checks every planned raw JSON artifact before creating storage or
+launching a trial; assessment checks its target again before writing. Tracked or
+unignored targets, symlinked or non-directory ancestors, nested Git repositories
+and paths outside the owning workspace are refused. Keep storage ignored
+throughout execution.
 Use owned fixtures and supported isolated checks. Untracked input outside `.piccolo`
 and uncommitted source prevent launching. External dependencies, host load, global
 skills and provider nondeterminism remain experimental limitations. Commit fixtures

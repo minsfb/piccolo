@@ -4,7 +4,9 @@ import { MemoryStorage } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createStageTask } from "../src/durable/stage.ts";
 import { Decisions } from "../src/durable/jobs.ts";
-import { RemoteSnapshots } from "../src/durable/remote-task.ts";
+import { RemoteTask, RemoteSnapshots } from "../src/durable/remote-task.ts";
+import { persistAdmission } from "../src/durable/admissions.ts";
+import { submissionSchema } from "../src/durable/contract.ts";
 import { setRecoveryNotice } from "../src/durable/recovery-notices.ts";
 import { JobsDoc } from "../src/durable/worker.ts";
 import { digest } from "../src/config.ts";
@@ -12,7 +14,7 @@ import { DurableWorker } from "../src/durable/worker.ts";
 import { managedModels } from "../src/durable/models.ts";
 import { askParent } from "../src/durable/supervisor.ts";
 import { serveWorker } from "../src/durable/service.ts";
-import { dispatchRemote, workerRequest } from "../src/durable/remote.ts";
+import { dispatchRemote, workerRequest, readDispatchState } from "../src/durable/remote.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -262,7 +264,7 @@ test("suspending terminal Jobs does not change a new owner's quit cancellation",
     const next = (await f.tools.get("piccolo_submit").execute("submit", { kind: "delegate", arguments: { task: "Answer" } }, undefined, undefined, f.ctx)).details.id;
     await eventually(async () => (await f.call({ action: "status", id: next })).attention_total === 1);
     await f.handlers.get("session_shutdown")!({ reason: "quit" }, f.ctx);
-    const saved = await discoverJobs(f.root, f.session, f.ctx); assert.equal(saved.jobs.find(job => job.id === next)?.state, "aborted");
+    const saved = await discoverJobs(f.root, f.session, f.ctx); assert.equal(saved.jobs.find(job => job.id === next)?.state, "cancelled");
   } finally { await f.handlers.get("session_shutdown")?.({ reason: "quit" }, f.ctx); f.cleanup(); }
 });
 
@@ -362,7 +364,7 @@ for (const action of ["cancel", "native"] as const) test(`changed policy permits
     if (action === "cancel") {
       await f.call({ action: "cancel_saved" }); assert.equal((await f.call({ action: "status", id })).state, "cancelled");
       await assert.rejects(f.call({ action: "resume" }), /Worker policy changed/);
-      const saved = await discoverJobs(f.root, f.session, f.ctx); assert.equal(saved.jobs[0].state, "aborted");
+      const saved = await discoverJobs(f.root, f.session, f.ctx); assert.equal(saved.jobs[0].state, "cancelled");
     } else {
       const next = (await f.tools.get("piccolo_submit").execute("native", { kind: "delegate", arguments: { task: "Proceed" } }, undefined, undefined, f.ctx)).details.id;
       await eventually(async () => (await f.call({ action: "status", id: next })).state === "completed");
@@ -440,7 +442,7 @@ test("detached independent notices can be dismissed and restored without contact
     fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(original), submission: { ...request, lifetime: "session" } }));
     assert.throws(() => setRecoveryNotice(f.root, request.requestId, true), /Only retained independent/);
     fs.writeFileSync(file, original); fs.unlinkSync(noticeFile); fs.symlinkSync(file, noticeFile);
-    assert.throws(() => setRecoveryNotice(f.root, request.requestId, true), /Invalid recovery/); assert.equal(fs.readFileSync(file, "utf8"), original);
+    assert.throws(() => setRecoveryNotice(f.root, request.requestId, true), /Invalid recovery|Runtime artifact must be a regular file/); assert.equal(fs.readFileSync(file, "utf8"), original);
   } finally { await f.handlers.get("session_shutdown")?.({ reason: "quit" }, f.ctx); await new Promise<void>(resolve => server.close(() => resolve())); await remote.close("suspend"); f.cleanup(); }
 });
 
@@ -492,4 +494,202 @@ test("recovery pages stay bounded and progress through stale notices even with o
     }
     assert.equal(found.size, ids.length); assert.equal(f.count(), 0);
   } finally { await f.handlers.get("session_shutdown")?.({ reason: "quit" }, f.ctx); f.cleanup(); }
+});
+
+// #38 G-002/LF-5: invalid advisory storage must stay visible and cannot hide work.
+test("recovery reports relocated dispatch topology and ignores malformed advisory receipts", async () => {
+  const f = fixture(), id = randomUUID(), directory = path.join(f.root, ".cache", "piccolo", "dispatch");
+  try {
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, `${id}.json`), JSON.stringify({ assignment: "0".repeat(64), submission: {
+      version: 1, registry: "piccolo-1", requestId: id, workspace: { host: "remote.invalid", cwd: "/fixture", identity: randomUUID() }, owner: "old-parent", lifetime: "independent", configDigest: "0".repeat(64), kind: "delegate",
+      stage: { name: "delegate", task: "Fixture", model: { provider: "fixture", modelId: "fixture" }, instructions: "Fixture", tools: [], thinkingLevel: "off", report: false, timeoutMs: 10000 }
+    } }));
+    fs.writeFileSync(path.join(directory, `${id}.dismissed.json`), "not JSON");
+    fs.writeFileSync(path.join(directory, `${id}.state.json`), "not JSON");
+    assert.equal((await discoverJobs(f.root, f.session, f.ctx)).independent[0].id, id);
+    const moved = path.join(f.root, ".cache", "relocated"); fs.renameSync(path.dirname(directory), moved);
+    fs.symlinkSync(moved, path.dirname(directory));
+    const invalid = await discoverJobs(f.root, f.session, f.ctx, undefined, true);
+    assert.match(invalid.error!, /Invalid retained dispatch directory/);
+    assert.equal(f.count(), 0);
+  } finally { f.cleanup(); }
+});
+
+// #38 G-003/LF-3: the summary carries availability without inspecting the result.
+test("active recovery retains error excerpts and result availability", async () => {
+  const f = fixture();
+  try {
+    await f.register();
+    const id = (await f.tools.get("piccolo_submit").execute("submit", { kind: "delegate", arguments: { task: "Proceed" } }, undefined, undefined, f.ctx)).details.id;
+    await eventually(async () => (await f.call({ action: "status", id })).state === "completed");
+    const page = await f.call({ action: "recovery" });
+    assert.equal(page.jobs.find((job: any) => job.id === id).has_result, true);
+    const status = await f.call({ action: "status", id });
+    await assert.rejects(f.call({ action: "ack", id, revision: status.outcome_revision, note: "Only saw a summary" }), /Inspect this terminal/);
+  } finally { await f.handlers.get("session_shutdown")?.({ reason: "quit" }, f.ctx); f.cleanup(); }
+});
+
+// #38 G-004/LF-2: a successful mark retry removes only the stale cancellation error.
+test("confirmed cancellation retry clears stale errors in live and reopened recovery", async () => {
+  const f = fixture(); let local: Awaited<ReturnType<typeof localJobs>> | undefined;
+  try {
+    local = await localJobs(f.root, f.ctx, { nativeSettings: f.pi.getSettings(), changed() {}, notify() {} });
+    const request: any = { version: 1, registry: "piccolo-1", requestId: randomUUID(), workspace: local.workspace, owner: f.session, lifetime: "session", configDigest: "0".repeat(64), kind: "delegate",
+      stage: { name: "delegate", task: "Answer", model: { provider: "fixture", modelId: "fixture" }, instructions: "Fixture", tools: [], thinkingLevel: "off", report: false, timeoutMs: 10000 } };
+    const id = await local.jobs.submit(request);
+    await eventually(async () => (await local!.jobs.worker.status(id)).attention.length === 1);
+    const abort = local.jobs.worker.harness.abortTask.bind(local.jobs.worker.harness); let fail = true;
+    local.jobs.worker.harness.abortTask = (...args: Parameters<typeof abort>) => { if (fail) { fail = false; return Promise.reject(new Error("Fixture cancellation mark failed")); } return abort(...args); };
+    await assert.rejects(local.jobs.worker.cancelSaved(f.session), /Fixture cancellation mark failed/);
+    assert.match((await local.jobs.worker.admission(id)).cancellationError!, /Fixture cancellation mark failed/);
+    await local.jobs.worker.cancelSaved(f.session); await local.jobs.refresh();
+    assert.equal((await local.jobs.worker.admission(id)).cancellationError, undefined);
+    assert.equal(local.jobs.status(id).state, "cancelled"); assert.equal(local.jobs.status(id).error, undefined);
+    await local.jobs.close("suspend"); local = undefined;
+    const saved = await discoverJobs(f.root, f.session, f.ctx);
+    assert.equal(saved.jobs[0].state, "cancelled"); assert.equal(saved.jobs[0].reason, undefined);
+    assert.equal(f.count(), 1);
+  } finally { if (local) await local.jobs.close("suspend"); f.cleanup(); }
+});
+
+// #38 G-001/LF-1: inspecting A never handles B, even when recovery races with ack.
+test("concurrent recovery cannot mark a newer uninspected outcome handled", { timeout: 30000 }, async () => {
+  const f = fixture(), identity = { host: os.hostname(), cwd: f.root, identity: randomUUID() }, notices: string[][] = [];
+  const remote = await DurableWorker.open({ workspace: identity, storage: new MemoryStorage(), models: managedModels(f.ctx.modelRegistry), tools: [askParent], env: () => undefined });
+  const socket = path.join(f.root, "worker.sock"), server = await serveWorker(remote, identity, socket, async () => {});
+  const target = { workspace: identity, transport: ["python3", path.resolve("scripts/durable-client.py"), socket] };
+  let local: Awaited<ReturnType<typeof localJobs>> | undefined;
+  try {
+    local = await localJobs(f.root, f.ctx, { nativeSettings: f.pi.getSettings(), changed() {}, notify(ids) { notices.push(ids); } });
+    const request: any = { version: 1, registry: "piccolo-1", requestId: randomUUID(), workspace: local.workspace, placement: target, owner: f.session, lifetime: "independent", configDigest: "0".repeat(64), kind: "delegate",
+      stage: { name: "delegate", task: "Answer", model: { provider: "fixture", modelId: "fixture" }, instructions: "Fixture", tools: [], thinkingLevel: "off", report: false, timeoutMs: 10000 } };
+    const id = await local.jobs.submit(request);
+    await eventually(async () => { await local!.jobs.refresh(); return local!.jobs.status(id).attention_total === 1; });
+    const current = await local.jobs.worker.admission(id), stateFile = path.join(f.root, ".cache", "piccolo", "dispatch", `${id}.state.json`);
+    if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile);
+    // A historical failed controller had no authoritative remote outcome/cache.
+    await local.jobs.worker.harness.commit(async tx => {
+      const task = (await tx.task(current.taskId as any))!;
+      delete (await tx.doc(RemoteSnapshots)).requests[id];
+      (tx as any).setTask({ ...task, state: { status: "terminal", outcome: { status: "failed", error: { message: "historical controller failure A" } } }, endedAt: Date.now() });
+    }, BACKGROUND_CONTEXT);
+    await local.jobs.refresh(); const oldRevision = local.jobs.status(id).outcome_revision!; local.jobs.result(id);
+    await new Promise(resolve => setTimeout(resolve, 150)); notices.length = 0;
+    const admission = local.jobs.worker.admission.bind(local.jobs.worker); let race = true;
+    local.jobs.worker.admission = async requestId => {
+      if (race && requestId === id) {
+        race = false;
+        await local!.jobs.worker.resumeSaved();
+        await workerRequest(target, { operation: "message", requestId: id, messageId: randomUUID(), text: "Proceed" });
+        await local!.jobs.worker.wait(id);
+      }
+      return admission(requestId);
+    };
+    await local.jobs.acknowledge(id, oldRevision, "Inspected historical failure A");
+    assert.equal(readDispatchState(f.root, id)!.handled, false);
+    await local.jobs.refresh(); const next = local.jobs.status(id);
+    assert.notEqual(next.outcome_revision, oldRevision); assert.equal(next.parent_review.disposition, "pending");
+    assert.throws(() => local!.jobs.resultPage(id, oldRevision), /terminal outcome revision/);
+    await assert.rejects(local.jobs.acknowledge(id, next.outcome_revision!, "Only inspected A"), /Inspect this terminal/);
+    await eventually(async () => notices.some(ids => ids.includes(id)));
+    assert.equal((await local.jobs.worker.harness.snapshot(Decisions, BACKGROUND_CONTEXT))!.decisions[id].revision, oldRevision);
+    await local.jobs.close("suspend"); local = undefined;
+    assert.equal((await discoverJobs(f.root, randomUUID(), f.ctx)).independent[0].id, id);
+  } finally { if (local) await local.jobs.close("suspend"); await new Promise<void>(resolve => server.close(() => resolve())); await remote.close("suspend"); f.cleanup(); }
+});
+
+// #38 G-005/LF-8: native ownership cannot conceal an attachment in the saved store.
+test("native Jobs retain saved Durable ownership checks when dismissing notices", { timeout: 30000 }, async () => {
+  const f = fixture(), identity = { host: os.hostname(), cwd: f.root, identity: randomUUID() };
+  const remote = await DurableWorker.open({ workspace: identity, storage: new MemoryStorage(), models: managedModels(f.ctx.modelRegistry), tools: [askParent], env: () => undefined });
+  const socket = path.join(f.root, "worker.sock"), server = await serveWorker(remote, identity, socket, async () => {});
+  const target = { workspace: identity, transport: ["python3", path.resolve("scripts/durable-client.py"), socket] };
+  let local: Awaited<ReturnType<typeof localJobs>> | undefined;
+  const request: any = { version: 1, registry: "piccolo-1", requestId: randomUUID(), workspace: identity, owner: "original-parent", lifetime: "independent", configDigest: "0".repeat(64), kind: "delegate",
+    stage: { name: "delegate", task: "Answer", model: { provider: "fixture", modelId: "fixture" }, instructions: "Fixture", tools: [], thinkingLevel: "off", report: false, timeoutMs: 10000 } };
+  try {
+    await dispatchRemote(f.root, target, request);
+    local = await localJobs(f.root, f.ctx, { nativeSettings: f.pi.getSettings(), changed() {}, notify() {} });
+    await local.jobs.worker.attach(request, target, f.session); await local.jobs.close("suspend"); local = undefined;
+    fs.mkdirSync(path.join(f.root, ".piccolo"), { recursive: true });
+    fs.writeFileSync(path.join(f.root, ".piccolo", "config.toml"), '[background]\nexecutor="native"\n');
+    await f.register();
+    await f.tools.get("piccolo_submit").execute("native", { kind: "delegate", arguments: { task: "Proceed" } }, undefined, undefined, f.ctx);
+    await assert.rejects(f.call({ action: "dismiss", id: request.requestId }), /Session Jobs require explicit management/);
+    const page = await f.call({ action: "recovery" });
+    assert.ok(page.jobs.some((job: any) => job.id === request.requestId));
+    assert.equal(fs.existsSync(path.join(f.root, ".cache", "piccolo", "dispatch", `${request.requestId}.dismissed.json`)), false);
+  } finally { if (local) await local.jobs.close("suspend"); await f.handlers.get("session_shutdown")?.({ reason: "quit" }, f.ctx); await new Promise<void>(resolve => server.close(() => resolve())); await remote.close("suspend"); f.cleanup(); }
+});
+
+// GD-1: stopping one saved result cannot authorize an unrelated dispatch.
+for (const route of ["worker", "jobs"] as const) test(`single saved stop keeps the mixed generation paused through ${route}`, { timeout: 15000 }, async () => {
+  const f = fixture(); let local: Awaited<ReturnType<typeof localJobs>> | undefined;
+  const calls = path.join(f.root, ".cache", "unexpected-transport"), transport = path.join(f.root, ".cache", "transport.py");
+  try {
+    local = await localJobs(f.root, f.ctx, { nativeSettings: f.pi.getSettings(), resume: false, changed() {}, notify() {} });
+    fs.writeFileSync(transport, `import pathlib\npathlib.Path(${JSON.stringify(calls)}).write_text('unexpected')\nraise RuntimeError('No transport is authorized')\n`);
+    const target = { workspace: { ...local.workspace, identity: randomUUID() }, transport: ["python3", transport] };
+    const conversation = await local.jobs.worker.harness.root(BACKGROUND_CONTEXT);
+    const verified = { status: "completed", result: { text: "Verified result" } } as const;
+    const originalIds: number[] = [], requests = ["session", "independent"].map(lifetime => submissionSchema.parse({
+      version: 1, registry: "piccolo-1", requestId: randomUUID(), workspace: local!.workspace, placement: target, owner: f.session, lifetime, configDigest: "0".repeat(64), kind: "delegate",
+      stage: { name: "delegate", task: "Answer", model: { provider: "fixture", modelId: "fixture" }, instructions: "Fixture", tools: [], thinkingLevel: "off", report: false, timeoutMs: 10000 }
+    }));
+    for (const [index, request] of requests.entries()) {
+      const { placement: _placement, ...submission } = { ...request, workspace: target.workspace };
+      const id = await local.jobs.worker.harness.commit(tx => tx.createTask(RemoteTask, { root: f.root, target, submission }, { ownership: { kind: "conversation" }, conversationId: conversation.id }), BACKGROUND_CONTEXT);
+      originalIds.push(id);
+      await local.jobs.worker.harness.commit(async tx => {
+        const task = (await tx.task(id))!;
+        // Retained native states from a crash: A has a receipt, B never dispatched.
+        (tx as any).setTask({ ...task, state: index === 0 ? { status: "terminal", outcome: { status: "faulted", error: { message: "Observer interrupted after saving receipt" } } } : { status: "running", checkpoint: { phase: "dispatch", attempts: 0, mayBeAdmitted: false } }, ...(index === 0 ? { endedAt: Date.now() } : {}) });
+        await persistAdmission(tx, request.requestId, { taskId: id, fingerprint: digest(request), input: request });
+        if (index === 0) (await tx.doc(RemoteSnapshots)).requests[request.requestId] = { fingerprint: digest(submission), taskId: 99, task: { id: 99, state: { status: "terminal", outcome: verified } }, children: [], messages: [], attention: [] };
+      }, BACKGROUND_CONTEXT);
+    }
+    await local.jobs.close("suspend"); local = undefined;
+    if (route === "worker") {
+      local = await localJobs(f.root, f.ctx, { nativeSettings: f.pi.getSettings(), resume: false, changed() {}, notify() {} });
+      await local.jobs.worker.abort(requests[0].requestId);
+      assert.equal(local.jobs.worker.savedSuspended, true);
+      assert.equal((await local.jobs.worker.harness.inspect(BACKGROUND_CONTEXT)).scheduling, "paused");
+      assert.equal((await local.jobs.worker.admission(requests[0].requestId)).taskId, originalIds[0]);
+      assert.deepEqual((await local.jobs.worker.harness.snapshot(RemoteSnapshots, BACKGROUND_CONTEXT))!.requests[requests[0].requestId].task!.state, { status: "terminal", outcome: verified });
+    } else {
+      await f.register();
+      await assert.rejects(f.call({ action: "cancel_saved" }), /include_independent=true/);
+      const stopped = await f.call({ action: "stop", id: requests[0].requestId });
+      assert.equal(stopped.state, "needs_parent");
+      assert.match(stopped.error, /Observer interrupted after saving receipt/);
+      await assert.rejects(f.call({ action: "wait", id: requests[1].requestId, wait_ms: 100 }), /Start saved cancellation/);
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(fs.existsSync(calls), false, "B must not dispatch and A must retain its verified receipt without transport");
+    assert.equal(f.count(), 0, "No model work is authorized");
+  } finally {
+    if (local) await local.jobs.close("suspend");
+    await f.handlers.get("session_shutdown")?.({ reason: "quit" }, f.ctx); f.cleanup();
+  }
+});
+
+// GD-2: expose failed-mark diagnostics before any successful retry.
+test("reopened recovery shows a nonterminal cancellation error in the bounded summary", async () => {
+  const f = fixture(); let local: Awaited<ReturnType<typeof localJobs>> | undefined;
+  try {
+    local = await localJobs(f.root, f.ctx, { nativeSettings: f.pi.getSettings(), changed() {}, notify() {} });
+    const request = submissionSchema.parse({ version: 1, registry: "piccolo-1", requestId: randomUUID(), workspace: local.workspace, owner: f.session, lifetime: "session", configDigest: "0".repeat(64), kind: "delegate",
+      stage: { name: "delegate", task: "Answer", model: { provider: "fixture", modelId: "fixture" }, instructions: "Fixture", tools: [], thinkingLevel: "off", report: false, timeoutMs: 10000 } });
+    const id = await local.jobs.submit(request);
+    await eventually(async () => (await local!.jobs.worker.status(id)).attention.length === 1);
+    local.jobs.worker.harness.abortTask = () => Promise.reject(new Error("Fixture storage mark failed"));
+    await assert.rejects(local.jobs.worker.abort(id), /Fixture storage mark failed/);
+    await local.jobs.close("suspend"); local = undefined;
+    await f.register();
+    const page = await f.call({ action: "recovery" }), job = page.jobs.find((job: { id: string }) => job.id === id);
+    assert.equal(job.terminal, false); assert.equal(job.state, "unresolved");
+    assert.match(job.reason, /Fixture storage mark failed/); assert.ok(job.reason.length <= 500);
+    assert.equal(f.count(), 1, "Recovery cannot retry inference or cancellation");
+  } finally { if (local) await local.jobs.close("suspend"); f.cleanup(); }
 });

@@ -310,9 +310,9 @@ test("current managed selection claims attention only through the installed exac
   try {
     registerManagedWake(adapter);
     handlers.get("session_start")({}, context);
-    // The real SDK test profile was installed before this session. Production
-    // capture hashes intentionally differ from the unbundled SDK, so install
-    // fails closed; explicitly restore only our test-qualified process adapter.
+    // This process already installed another (test-only) profile, which the
+    // production installer rejects before comparing method hashes. Restore
+    // only that explicit test adapter for this unit fixture.
     registerManagedWake(adapter);
     assert.equal(health.facts().wake_capability, true);
     assert.equal(claim(), true);
@@ -370,10 +370,71 @@ test("Pi 1.4 interrupted-start cleanup preserves observer errors without leaving
   assert.equal(h.session.isIdle, true);
 });
 
+test("Pi 1.4 interrupted start flushes newly queued passive bash and custom messages", { skip: VERSION !== "1.4.0" }, async () => {
+  const h = harness(); h.auth.resolve(); h.finished.resolve();
+  const custom: any[] = [], bash: any[] = [];
+  h.session._pendingCustomMessages = [{ role: "custom", customType: "cancel-canary", content: "synthetic" }];
+  h.session._pendingBashMessages = [];
+  delete h.session._flushPendingCustomMessages; delete h.session._flushPendingBashMessages;
+  h.session.sessionManager.appendCustomMessageEntry = (type: string) => { custom.push(type); };
+  h.session.sessionManager.appendMessage = (message: any) => { bash.push(message); };
+  h.session._refreshFinalizedContext = () => {};
+  let aborted: Promise<void> | undefined;
+  h.session.subscribe((event: any) => {
+    if (event.type === "message_end" && event.message.customType === "cancel-canary") {
+      aborted = h.session.abort();
+      void h.session.sendCustomMessage({ customType: "queued-passive", content: "Persist this passive notice", display: false }, { triggerTurn: false });
+      h.session._pendingBashMessages.push({ role: "bashExecution", command: "owned", output: "owned", timestamp: 1 });
+    }
+  });
+  await assert.rejects(h.session.prompt("UNSUBMITTED"), /interrupted/); await aborted;
+  assert.equal(h.runs.length, 0); assert.equal(h.session.isIdle, true);
+  assert.deepEqual(custom, ["cancel-canary", "queued-passive"]);
+  assert.equal(bash.length, 1); assert.deepEqual(h.session._pendingBashMessages, []); assert.deepEqual(h.session._pendingCustomMessages, []);
+});
+
+test("modern custom-message cancellation restores unsubmitted next-turn context", async () => {
+  const h = harness(); h.auth.resolve(); const gate = deferred();
+  const retained = { role: "custom", customType: "nextTurn", content: "KEEP CONTEXT" };
+  h.session._pendingNextTurnMessages = [retained];
+  h.session._extensionRunner.beforeHook = async () => { await gate.promise; };
+  const sending = h.session.sendCustomMessage({ customType: "trigger", content: "Cancelled trigger" }, { triggerTurn: true });
+  const rejected = assert.rejects(sending, /interrupted/);
+  await tick(); const aborted = h.session.abort(); gate.resolve(); await rejected; await aborted;
+  assert.equal(h.runs.length, 0); assert.deepEqual(h.session._pendingNextTurnMessages, [retained]);
+});
+
+for (const subscriber of ["extension", "public"] as const) test(`Pi 1.4 cancellation defers ${subscriber} settlement requests until context is restored`, { skip: VERSION !== "1.4.0" }, async () => {
+  const h = harness(); h.auth.resolve(); h.finished.resolve();
+  h.session._pendingCustomMessages = [{ role: "custom", customType: "cancel-canary", content: "synthetic" }];
+  delete h.session._flushPendingCustomMessages;
+  h.session.sessionManager.appendCustomMessageEntry = () => {};
+  h.session._refreshFinalizedContext = () => {};
+  const retained = { role: "custom", customType: "nextTurn", content: "KEEP CONTEXT" };
+  h.session._pendingNextTurnMessages = [retained];
+  let aborted: Promise<void> | undefined, requested = false;
+  const request = () => { requested = true; return h.session.sendCustomMessage({ customType: "settled-request", content: "Inspect completion" }, { triggerTurn: true }); };
+  const unsubscribe = h.session.subscribe((event: any) => {
+    if (event.type === "message_end") aborted = h.session.abort();
+    if (subscriber === "public" && event.type === "agent_settled" && !requested) void request();
+  });
+  h.session._extensionRunner.emit = async (event: any) => {
+    if (subscriber === "extension" && event.type === "agent_settled" && !requested) await request();
+  };
+  await assert.rejects(h.session.prompt("UNSUBMITTED"), /interrupted/);
+  assert.ok(aborted); await aborted; await tick(); unsubscribe();
+  assert.equal(requested, true); assert.equal(h.runs.length, 1);
+  assert.equal(h.runs[0][0].customType, "settled-request");
+  assert.deepEqual(h.runs[0].slice(1), [retained]);
+  assert.equal(h.session.isIdle, true);
+});
+
 test("Pi 1.4 cleanup helper drift revokes wake capability", { skip: VERSION !== "1.4.0" }, () => {
-  const h = harness();
-  assert.equal(adapter.supports(h.ctx), true);
-  h.session._emitAgentSettled = async () => {};
-  assert.equal(adapter.supports(h.ctx), false);
-  assert.equal(h.wake().status, "unsupported");
+  for (const method of CLEANUP_METHODS) {
+    const h = harness();
+    assert.equal(adapter.supports(h.ctx), true);
+    h.session[method] = async () => {};
+    assert.equal(adapter.supports(h.ctx), false);
+    assert.equal(h.wake().status, "unsupported");
+  }
 });

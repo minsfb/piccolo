@@ -1,6 +1,6 @@
 import { assessTrial } from "./assessment.ts";
 import { exportRoadmap } from "./roadmap-export.ts";
-import { workerRequest, readDispatchState, cacheDispatchState } from "./remote.ts";
+import { workerRequest, readDispatchState, cacheDispatchState, RemoteRejected, retainedAssignment } from "./remote.ts";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { BACKGROUND_CONTEXT as context, withCancel } from "@earendil-works/chord/context";
@@ -14,9 +14,10 @@ import { SupervisorDoc } from "./supervisor.ts";
 import { WorkerWaitCancelled } from "./wait.ts";
 import { stageActivity } from "./stage.ts";
 import { outcomeProjection } from "./outcome.ts";
+import { readAdmissions } from "./admissions.ts";
+import { Decisions } from "./decisions.ts";
+export { Decisions } from "./decisions.ts";
 
-type Decision = { disposition: "acknowledged" | "superseded"; revision: string; note: string; at: string; replacement?: string };
-export const Decisions = defineDoc<{ decisions: Record<string, Decision>; history?: Record<string, Decision[]> }>({ kind: "piccolo.decisions", version: 1, scope: "session", initial: () => ({ decisions: {} }) });
 const Notifications = defineDoc<{ modes: Record<string, "follow_up" | "notify_only"> }>({ kind: "piccolo.job-notifications", version: 1, scope: "session", initial: () => ({ modes: {} }) });
 type Status = ReturnType<SessionJobs["status"]> & { attention?: Array<{ id: string; question: string; stage: string }>; attention_total?: number; cwd?: string; origin?: WorkerSubmission["origin"] };
 type Cached = { status: Status; result?: unknown; error?: string; inspected?: string; ranges: Array<[number, number]> };
@@ -52,7 +53,7 @@ export class DurableJobs {
     });
   }
   async refresh() {
-    const admissions = (await this.worker.harness.snapshot(JobsDoc, context))?.requests ?? {};
+    const admissions = await readAdmissions(this.worker.harness, context);
     const decisions = (await this.worker.harness.snapshot(Decisions, context))?.decisions ?? {};
     const messages = (await this.worker.harness.snapshot(MessagesDoc, context))?.messages ?? {};
     const questions = (await this.worker.harness.snapshot(SupervisorDoc, context))?.requests ?? {};
@@ -87,10 +88,11 @@ export class DurableJobs {
         const decision = message.supervisorId ? await this.worker.harness.getTask(Number(message.supervisorId) as any, context) : undefined;
         const queued = message.queuedStageId ? await this.worker.harness.getTask(message.queuedStageId as any, context) : undefined;
         const delivered = receipt?.status === "done" || decision?.state.status === "terminal" || (queued?.state.status === "terminal" && queued.state.outcome.status === "completed");
-        instructions.push({ id: messageId, target: message.target ?? undefined, state: message.remoteState === "unresolved" ? "uncertain" : message.remoteState === "pending" ? "queued" : delivered ? "delivered" : receipt?.status === "unanswered" ? "rejected" : message.queuedStageId && !message.conversationId ? "queued" : "routed",
+        instructions.push({ id: messageId, target: message.target ?? undefined, state: message.remoteState === "rejected" ? "rejected" : message.remoteState === "unresolved" ? "uncertain" : message.remoteState === "pending" ? "queued" : delivered ? "delivered" : receipt?.status === "unanswered" ? "rejected" : message.queuedStageId && !message.conversationId ? "queued" : "routed",
           ...(delivered ? { observation: "durable_input_answered; action_not_verified" } : {}) });
       }
       const status: Status = { id, kind: admission.input.kind, state, stopping: task.abortRequested, lifetime: admission.input.lifetime, host: (admission.input.placement?.workspace ?? admission.input.workspace).host,
+        has_result: result !== undefined,
         cwd: admission.input.cwd ?? admission.input.placement?.workspace.cwd ?? admission.input.workspace.cwd, origin: admission.input.origin,
         updated_at: task.endedAt ?? task.startedAt ?? Date.now(), record: `durable:${admission.input.workspace.identity}/${id}`, error_truncated: (error?.length ?? 0) > 1000,
         outcome_revision: revision, parent_review: decisions[id] && revision && decisions[id].revision === revision ? decisions[id] : { disposition: outcome ? "pending" : "not_ready" }, error: error?.slice(0, 1000),
@@ -161,7 +163,8 @@ export class DurableJobs {
       const cached = readDispatchState(this.root, id), task = (await this.worker.inspect(id)).task;
       if (cached && task?.state.status === "terminal") {
         const outcome: any = task.state.outcome;
-        cacheDispatchState(this.root, admission.input.placement, id, cached.state, cached.state === "rejected" ? outcome.result?.admission : outcome, true);
+        if (outcomeProjection(outcome, undefined, admission.cancellationError).revision === revision)
+          cacheDispatchState(this.root, admission.input.placement, id, cached.state, cached.state === "rejected" ? outcome.result?.admission : outcome, true);
       }
     } catch { /* The durable parent decision remains authoritative if advisory cache is unavailable. */ }
     return this.status(id);
@@ -171,6 +174,7 @@ export class DurableJobs {
     if (!text.trim() || text.length > 16000) throw new Error("Instruction must contain 1..16000 characters");
     const prior = (await this.worker.harness.snapshot(MessagesDoc, context))?.messages[messageId];
     if (prior && (prior.requestId !== id || prior.text !== text || prior.target !== (target ?? null))) throw new Error("Message ID reused with different input");
+    if (prior?.remoteState === "rejected") throw new Error(prior.remoteError ?? "Original worker rejected this Job before admission");
     const children = this.status(id).children;
     if (!prior && !target && children.length > 1) throw new Error("Select a single active stage before messaging this workflow");
     // Persist the identity before a remote send. The same explicit message ID
@@ -179,6 +183,7 @@ export class DurableJobs {
     if (assignment) await this.worker.harness.commit(async tx => {
       const doc = await tx.doc(MessagesDoc), prior = doc.messages[messageId];
       if (prior && (prior.requestId !== id || prior.text !== text || prior.target !== (target ?? null))) throw new Error("Message ID reused with different input");
+      if (!prior && Object.values(doc.messages).filter(message => message.requestId === id).length >= 1000) throw new Error("Job instruction budget reached");
       doc.messages[messageId] ??= { requestId: id, text, target: target ?? null, conversationId: 0, submissionId: null, remoteState: "pending" };
     }, context);
     try {
@@ -186,7 +191,15 @@ export class DurableJobs {
       if (assignment) await this.worker.harness.commit(async tx => { const value = (await tx.doc(MessagesDoc)).messages[messageId]; value.remoteState = "routed"; value.remoteReceipt = submission; }, context);
       return { id: messageId, state: "routed", submission };
     } catch (error) {
-      if (assignment) await this.worker.harness.commit(async tx => { (await tx.doc(MessagesDoc)).messages[messageId].remoteState = "unresolved"; }, context);
+      let rejected = false;
+      if (assignment && error instanceof RemoteRejected && error.admission?.state === "rejected") {
+        try { rejected = error.admission.requestId === id && error.admission.fingerprint === digest(retainedAssignment(this.root, assignment, id).submission); }
+        catch { /* Missing assignment cannot prove rejection. */ }
+      }
+      if (assignment) await this.worker.harness.commit(async tx => {
+        const message = (await tx.doc(MessagesDoc)).messages[messageId];
+        message.remoteState = rejected ? "rejected" : "unresolved"; message.remoteError = String(error).slice(0, 1000);
+      }, context);
       throw error;
     }
   }

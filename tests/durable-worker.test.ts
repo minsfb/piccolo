@@ -10,7 +10,7 @@ import { Type } from "typebox";
 import { WorkerWaitCancelled } from "../src/durable/wait.ts";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import { defineTool, defineDoc, createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
-import { RemoteSnapshots } from "../src/durable/remote-task.ts";
+import { RemoteTask, RemoteSnapshots } from "../src/durable/remote-task.ts";
 import { DurableWorker } from "../src/durable/worker.ts";
 import { openWorkerStorage } from "../src/durable/storage.ts";
 import { submissionSchema, type WorkerSubmission } from "../src/durable/contract.ts";
@@ -29,6 +29,9 @@ import { workerRequest, retainedAssignment, dispatchRemote } from "../src/durabl
 import { localJobs } from "../src/durable/local.ts";
 import { inspectSchedule } from "../src/scheduler.ts";
 import { readExperiment } from "../src/experiments.ts";
+import { JobsDoc, JobInputs, persistAdmission } from "../src/durable/admissions.ts";
+import { createStageTask } from "../src/durable/stage.ts";
+import { acquireScheduleLock } from "../src/scheduler.ts";
 
 const workspace = { host: os.hostname(), cwd: fs.realpathSync(os.tmpdir()), identity: randomUUID() };
 async function eventually(check: () => Promise<boolean>, timeout = 10000) {
@@ -86,6 +89,7 @@ test("failed compaction capacity admission declines before invoking the summariz
     const compact = await conversation.compact(undefined, BACKGROUND_CONTEXT);
     const outcome = await worker.harness.waitForTask(compact, BACKGROUND_CONTEXT);
     assert.equal(outcome.state.outcome.status, "completed"); assert.equal(summaries, 0);
+    assert.match(worker.capabilities().compactionError!, /capacity denied/, "Declined compaction exposes its admission error");
     assert.equal((await conversation.context(BACKGROUND_CONTEXT)).head, undefined);
     denied = false; await worker.abort(request.requestId);
   } finally { await worker.close("suspend"); }
@@ -480,6 +484,7 @@ test("Durable dependency join integrates two exact predecessors before the depen
   fs.mkdirSync(path.join(root, ".piccolo"));
   const roadmap = path.join(root, ".piccolo", "roadmap.json");
   fs.writeFileSync(roadmap, JSON.stringify({ format: 1, tasks: ["one", "two", "three"].map(id => ({ id, title: id, status: "planned", needs: id === "three" ? [{ task: "one" }, { task: "two" }] : [] })) }));
+  fs.chmodSync(roadmap, 0o644);
   git(root, "add", "."); git(root, "commit", "-m", "base");
   fs.mkdirSync(path.join(root, ".cache"));
   const base = git(root, "rev-parse", "HEAD"), identity = { ...workspace, cwd: root };
@@ -510,6 +515,7 @@ test("Durable dependency join integrates two exact predecessors before the depen
     for (const id of ["one", "two"]) git(root, "merge-base", "--is-ancestor", result.results[id].result.candidate, candidate);
     assert.equal(model.count(), 9);
     const exported = await exportRoadmap(worker, envelope.requestId);
+    assert.equal(fs.statSync(roadmap).mode & 0o777, 0o644, "Roadmap export preserves the tracked document mode");
     assert.equal((await exportRoadmap(worker, envelope.requestId)).digest, exported.digest);
     const projected = JSON.parse(fs.readFileSync(roadmap, "utf8")).tasks.find((task: any) => task.id === "three");
     assert.equal(projected.status, "complete");
@@ -517,6 +523,10 @@ test("Durable dependency join integrates two exact predecessors before the depen
     assert.equal(projected.recorded_dependencies.one, result.results.one.result.candidate);
     fs.writeFileSync(roadmap, fs.readFileSync(roadmap, "utf8") + " ");
     await assert.rejects(exportRoadmap(worker, envelope.requestId), /changed after export/);
+    const bytes = fs.readFileSync(roadmap); fs.unlinkSync(roadmap);
+    const external = path.join(root, ".cache", "external-roadmap.json"); fs.writeFileSync(external, bytes); fs.symlinkSync(external, roadmap);
+    await assert.rejects(exportRoadmap(worker, envelope.requestId), /symlink|symbolic|Unsafe/i);
+    assert.deepEqual(fs.readFileSync(external), bytes, "Aliased export cannot alter the target");
   } finally { await worker.close("suspend"); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -597,6 +607,7 @@ test("remote service reconnect preserves assignment, supervisor attention and in
     retainedAssignment(root, target, request.requestId);
     assert.throws(() => retainedAssignment(root, { ...target, workspace: { ...remoteIdentity, identity: randomUUID() } }, request.requestId), /original worker/);
     await assert.rejects(workerRequest({ ...target, workspace: identity }, { operation: "info" }), /identity mismatch/);
+    server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
     await new Promise(resolve => setTimeout(resolve, 1400));
     assert.notEqual((await local.inspect(request.requestId)).task!.state.status, "terminal");
@@ -1017,6 +1028,52 @@ for (const restart of [false, true]) test(`aggregate pipeline deadline cancels a
   } finally { await worker.close("suspend"); store.release(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("completed Jobs consume the admission budget until their exact outcome is acknowledged", async () => {
+  const worker = await DurableWorker.open({ workspace, models: models().models, storage: new MemoryStorage(), tools: [], env: () => undefined, maxJobs: 1 });
+  const jobs = new DurableJobs(workspace.cwd, "test", worker, { changed() {}, notify() {}, release() {} });
+  try {
+    const first = input(); await jobs.submit(first); await worker.wait(first.requestId); await jobs.refresh();
+    const next = input(); await assert.rejects(jobs.submit(next), /admission budget/);
+    const result = jobs.result(first.requestId);
+    await jobs.acknowledge(first.requestId, result.outcome_revision!, "Inspected and handled the result");
+    await jobs.submit(next); await worker.wait(next.requestId);
+    const index = (await worker.harness.snapshot(JobsDoc, BACKGROUND_CONTEXT))!.requests;
+    assert.equal(index[first.requestId].input, undefined);
+    assert.equal(index[first.requestId].inputKey, first.requestId);
+    assert.deepEqual((await worker.harness.snapshot(JobInputs, first.requestId, BACKGROUND_CONTEXT))!.input, first);
+    await assert.rejects(worker.harness.commit(tx => persistAdmission(tx, first.requestId, { ...(index[first.requestId] as any), input: { ...first, owner: "another" } }), BACKGROUND_CONTEXT), /Immutable Job input changed/);
+    assert.deepEqual((await worker.admission(first.requestId)).input, first);
+  } finally { await jobs.close("suspend"); }
+});
+
+test("legacy Job inputs migrate without losing source or resetting owner launch accounting", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pd-legacy-inputs-"));
+  const legacyJobs = defineDoc<{ requests: Record<string, any> }>({ kind: "piccolo.jobs", version: 1, scope: "session", initial: () => ({ requests: {} }) });
+  const stage = createStageTask(() => ({ tools: [] }));
+  const model = models(); const request = input() as Extract<WorkerSubmission, { kind: "delegate" }>;
+  let store = await openWorkerStorage(directory, workspace);
+  const old = await Harness.open(store.storage, { registry: createRegistry(), models: model.models, env: () => undefined }, BACKGROUND_CONTEXT);
+  const root = await old.root(BACKGROUND_CONTEXT);
+  await old.commit(async tx => {
+    const taskId = await tx.createTask(stage, { spec: request.stage, cwd: workspace.cwd }, { ownership: { kind: "conversation" }, conversationId: root.id });
+    (await tx.doc(legacyJobs)).requests[request.requestId] = { taskId, fingerprint: (await import("../src/config.ts")).digest(request), input: request };
+  }, BACKGROUND_CONTEXT);
+  await old.close(BACKGROUND_CONTEXT); store.release(); store = await openWorkerStorage(directory, workspace);
+  const worker = await DurableWorker.open({ workspace, storage: store.storage, models: model.models, tools: [], env: () => undefined, resume: false, maxLaunchesPerOwner: 1 });
+  try {
+    assert.deepEqual((await worker.admission(request.requestId)).input, request);
+    assert.equal((await worker.harness.snapshot(JobsDoc, BACKGROUND_CONTEXT))!.requests[request.requestId].input, undefined);
+    assert.equal(model.count(), 0, "Migration cannot enable scheduling");
+    const launches = defineDoc<{ initialized: boolean; owners: Record<string, number[]> }>({ kind: "piccolo.stage-launches", version: 1, scope: "session", initial: () => ({ initialized: false, owners: {} }) });
+    assert.equal((await worker.inspect(request.requestId)).task!.kind, "piccolo.stage");
+    assert.equal((await worker.harness.snapshot(launches, BACKGROUND_CONTEXT))!.owners.test?.length, 1, "Migration counts the saved owned stage");
+    await worker.cancelSaved("test"); const next = input(); await worker.submit(next);
+    const outcome: any = (await worker.wait(next.requestId)).state.outcome;
+    assert.match(outcome.error?.message ?? JSON.stringify(outcome), /launch guideline/);
+    assert.equal(model.count(), 0, "Legacy owner charges survive the new input layout");
+  } finally { await worker.close("suspend"); store.release(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("schedule budget rejection creates no immutable claims", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pd-claims-budget-")));
   const git = (...args: string[]) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8", stdio: "pipe" }).trim();
@@ -1101,7 +1158,11 @@ for (const control of ["stop", "session-close", "late-result"] as const) test(`u
   const request = { ...input(), lifetime: "session" as const, workspace: identity, placement: { workspace: remoteIdentity, transport: ["python3", path.resolve("scripts/durable-client.py"), socket] } };
   try {
     await jobs.submit(request); await eventually(async () => { await jobs.refresh(); return jobs.status(request.requestId).attention_total === 1; });
-    await eventually(async () => { const state = (await local.inspect(request.requestId)).task!.state as any; return state.status === "terminal" || state.checkpoint?.poll >= 3; });
+    let publications = 0;
+    const unsubscribe = local.harness.subscribeCommits(() => { publications++; });
+    await new Promise(resolve => setTimeout(resolve, 3200));
+    unsubscribe();
+    assert.equal(publications, 0, "Unchanged remote observation does not write repeated snapshots or phase records");
     assert.notEqual((await local.inspect(request.requestId)).task!.state.status, "terminal"); assert.equal(model.count(), 1);
     if (control === "stop") await jobs.stop(request.requestId, 3000);
     else if (control === "session-close") await jobs.close("quit");
@@ -1234,6 +1295,37 @@ test("a base-format fingerprint-only store recovers its original compaction poli
   finally { await worker.close("suspend"); store.release(); fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
+// #38 DDC-20: saved dispatch must stay paused even without an explicit resume:false.
+test("cancellation-only startup marks a saved dispatch before any transport submission", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pd-cancel-dispatch-")));
+  execFileSync("git", ["-C", root, "init"], { stdio: "ignore" }); fs.writeFileSync(path.join(root, ".gitignore"), "/.cache/\n"); fs.mkdirSync(path.join(root, ".cache"));
+  const identity = { ...workspace, cwd: root }, remoteIdentity = { ...identity, identity: randomUUID() };
+  const transport = path.join(root, ".cache", "transport.py"), calls = path.join(root, ".cache", "calls.txt");
+  fs.writeFileSync(transport, `import json,sys,pathlib\nr=json.load(sys.stdin)\nwith pathlib.Path(${JSON.stringify(calls)}).open('a') as f:f.write(r['operation']+'\\n')\nif r['operation']!='abort':raise RuntimeError('Saved dispatch ran before cancellation')\nprint(json.dumps({'result':{'id':99,'kind':'piccolo.stage','state':{'status':'terminal','outcome':{'status':'aborted'}}}}))\n`);
+  const target = { workspace: remoteIdentity, transport: ["python3", transport] }, request = { ...input(), workspace: identity, placement: target, lifetime: "session" as const };
+  const original = { ...request, workspace: remoteIdentity }; delete (original as any).placement;
+  const model = models(), options = { workspace: identity, models: model.models, tools: [], env: () => undefined }, directory = path.join(root, ".cache", "store");
+  let store = await openWorkerStorage(directory, identity), worker = await DurableWorker.open({ ...options, storage: store.storage, resume: false });
+  try {
+    const conversation = await worker.harness.root(BACKGROUND_CONTEXT);
+    const id = await worker.harness.commit(tx => tx.createTask(RemoteTask, { root, target, submission: original }, { ownership: { kind: "conversation" }, conversationId: conversation.id }), BACKGROUND_CONTEXT);
+    await worker.harness.commit(async tx => {
+      const task = (await tx.task(id as any))!;
+      (tx as any).setTask({ ...task, state: { status: "running", checkpoint: { phase: "dispatch", attempts: 0, mayBeAdmitted: false } } });
+      await persistAdmission(tx, request.requestId, { taskId: id, fingerprint: (await import("../src/config.ts")).digest(request), input: request });
+    }, BACKGROUND_CONTEXT);
+    await worker.close("suspend"); store.release(); store = await openWorkerStorage(directory, identity);
+    worker = await DurableWorker.open({ ...options, storage: store.storage, cancellationOnly: true });
+    assert.equal((await worker.harness.inspect(BACKGROUND_CONTEXT)).scheduling, "paused");
+    assert.equal(((await worker.inspect(request.requestId)).task!.state as any).checkpoint.phase, "dispatch");
+    assert.equal(fs.existsSync(calls), false);
+    await worker.cancelSaved("test");
+    assert.equal(((await worker.inspect(request.requestId)).task!.state as any).outcome.status, "aborted");
+    assert.equal(fs.readFileSync(calls, "utf8"), "abort\n", "Cancellation never invokes info, submit or dispatch preflight");
+    assert.equal(model.count(), 0);
+  } finally { await worker.close("suspend"); store.release(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("saved-store protection is enforced by Worker submit and wait until an explicit decision", { timeout: 10000 }, async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pd-store-fence-")), model = models(() => ({ type: "toolCall", id: "question", name: "ask_parent", arguments: { question: "Wait" } }));
   const options = { workspace, models: model.models, tools: [askParent], env: () => undefined };
@@ -1288,7 +1380,7 @@ for (const committed of [false, true]) test(`schedule commit failure ${committed
   } finally { (worker.harness as any).commit = original; await worker.close("suspend"); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-for (const shape of ["faulted", "legacy"] as const) for (const action of (shape === "legacy" ? ["resume", "stop", "cancel", "cancel-unavailable", "quit"] : ["resume", "stop", "cancel", "cancel-unavailable", "cancel-race", "cancel-race-unavailable", "cancel-race-window", "quit"]) as string[]) test(`explicit ${action} repairs a ${shape} remote controller without resubmitting its agent`, { timeout: 15000 }, async () => {
+for (const shape of ["faulted", "legacy"] as const) for (const action of (shape === "legacy" ? ["resume", "doc-flag-cancel", "stop", "cancel", "cancel-unavailable", "quit"] : ["resume", "doc-flag-cancel", "stop", "cancel", "cancel-unavailable", "cancel-race", "cancel-race-unavailable", "cancel-race-window", "quit"]) as string[]) test(`explicit ${action} repairs a ${shape} remote controller without resubmitting its agent`, { timeout: 15000 }, async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pd-controller-repair-")));
   execFileSync("git", ["-C", root, "init"], { stdio: "ignore" }); fs.writeFileSync(path.join(root, ".gitignore"), "/.cache/\n");
   const identity = { ...workspace, cwd: root }, remoteIdentity = { ...identity, identity: randomUUID() }, model = models(context => JSON.stringify(context.messages).includes("Proceed") ? "done" : { type: "toolCall", id: "question", name: "ask_parent", arguments: { question: "Wait" } });
@@ -1308,8 +1400,15 @@ for (const shape of ["faulted", "legacy"] as const) for (const action of (shape 
       // retry preflight rejection. The separate lost-reply/privacy test exercises
       // that real trigger; this persisted fixture preserves its unclassified shape.
       if (shape === "legacy") delete (await tx.doc(RemoteSnapshots)).requests[request.requestId];
+      if (action === "doc-flag-cancel") (await tx.doc(JobsDoc)).requests[request.requestId].cancellationRequested = true;
       (tx as any).setTask({ ...record, state: { status: "terminal", outcome: { status: shape === "legacy" ? "failed" : "faulted", error: { message: shape === "legacy" ? "local retry rejected after lost admission reply" : "legacy idle poll fault" } } }, endedAt: Date.now() }); }, BACKGROUND_CONTEXT);
     if (action === "resume") await local.resumeSaved();
+    else if (action === "doc-flag-cancel") {
+      assert.equal((await local.inspect(request.requestId)).task!.abortRequested, false, "Only the logical Job carries cancellation intent");
+      await local.resumeSaved(); await local.wait(request.requestId);
+      assert.equal(((await local.inspect(request.requestId)).task!.input as any).cancel, true);
+      assert.equal(((await remote.inspect(request.requestId)).task!.state as any).outcome.status, "aborted");
+    }
     else if (action === "stop") await local.abort(request.requestId);
     else if (action === "quit") {
       await local.close("cancel-session", "test"); store.release(); store = await openWorkerStorage(directory, identity);
@@ -1342,7 +1441,7 @@ for (const shape of ["faulted", "legacy"] as const) for (const action of (shape 
           assert.equal((saved.task!.input as any).cancel, false, "resume won with an ordinary observer, so persistence must live on the Job");
           await local.close("suspend"); store.release(); server = await serveWorker(remote, remoteIdentity, socket, async () => {});
           store = await openWorkerStorage(directory, identity); local = await DurableWorker.open({ workspace: identity, models: models().models, storage: store.storage, tools: [], env: () => undefined, resume: false });
-          assert.equal((await local.inspect(request.requestId)).task!.abortRequested, true, "reopening reconciles Job intent before scheduling");
+          assert.equal((await local.inspect(request.requestId)).task!.abortRequested, true, "The earlier winner mark survives reopening; the separate doc-flag-only case covers missing-mark reconciliation");
           await local.resumeSaved(); await local.wait(request.requestId);
           assert.equal((await local.admission(request.requestId)).cancellationRequested, true);
         }
@@ -1403,6 +1502,94 @@ for (const transient of [false, true]) for (const control of ["stop", "cancel", 
     const operations = fs.readFileSync(calls, "utf8").trim().split("\n").map(line => JSON.parse(line).operation);
     assert.deepEqual(operations, transient ? ["info", "info"] : ["info"]);
   } finally { await local.close("suspend"); store.release(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const control of ["stop", "cancel", "quit"] as const) test(`a never-admitted legacy controller preserves durable rejection under ${control} and closes without repeated transport`, async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pd-legacy-rejected-")));
+  execFileSync("git", ["-C", root, "init"], { stdio: "ignore" }); fs.writeFileSync(path.join(root, ".gitignore"), "/.cache/\n");
+  const identity = { ...workspace, cwd: root }, remoteIdentity = { ...identity, identity: randomUUID() }, model = models();
+  model.models.getModel = () => undefined;
+  const remote = await DurableWorker.open({ workspace: remoteIdentity, models: model.models, storage: new MemoryStorage(), tools: [], env: () => undefined });
+  const socket = path.join(root, "worker.sock"), server = await serveWorker(remote, remoteIdentity, socket, async () => {});
+  const transport = path.join(root, "transport.py"), calls = path.join(root, "calls.txt");
+  fs.writeFileSync(transport, `import sys,json,pathlib,subprocess\nr=json.load(sys.stdin)\nwith pathlib.Path(${JSON.stringify(calls)}).open('a') as f:f.write(r['operation']+'\\n')\np=subprocess.run([sys.executable,${JSON.stringify(path.resolve("scripts/durable-client.py"))},${JSON.stringify(socket)}],input=json.dumps(r),capture_output=True,text=True)\nsys.stdout.write(p.stdout)\nsys.exit(p.returncode)\n`);
+  const target = { workspace: remoteIdentity, transport: ["python3", transport] };
+  const directory = path.join(root, ".cache", "controller"), options = { workspace: identity, models: models().models, tools: [], env: () => undefined, resume: false };
+  let store = await openWorkerStorage(directory, identity), worker = await DurableWorker.open({ ...options, storage: store.storage });
+  let jobs = new DurableJobs(root, "test", worker, { changed() {}, notify() {}, release() {} });
+  const request = { ...input(), workspace: identity, placement: target, lifetime: "session" as const };
+  const original = { ...request, workspace: remoteIdentity }; delete (original as any).placement;
+  try {
+    await assert.rejects(dispatchRemote(root, target, original), /Model unavailable/);
+    const conversation = await worker.harness.root(BACKGROUND_CONTEXT);
+    const oldId = await worker.harness.commit(tx => tx.createTask(RemoteTask, { root, target, submission: original }, { ownership: { kind: "conversation" }, conversationId: conversation.id }), BACKGROUND_CONTEXT);
+    await worker.harness.commit(async tx => {
+      const old = (await tx.task(oldId as any))!;
+      (tx as any).setTask({ ...old, state: { status: "terminal", outcome: { status: "failed", error: { message: "Historical unclassified controller rejection" } } } });
+      await persistAdmission(tx, request.requestId, { taskId: oldId, fingerprint: (await import("../src/config.ts")).digest(request), input: request });
+    }, BACKGROUND_CONTEXT);
+    await jobs.close("suspend"); store.release(); store = await openWorkerStorage(directory, identity); worker = await DurableWorker.open({ ...options, storage: store.storage });
+    jobs = new DurableJobs(root, "test", worker, { changed() {}, notify() {}, release() {} });
+    await jobs.refresh();
+    const messageId = randomUUID();
+    await assert.rejects(jobs.message(request.requestId, "Proceed", undefined, messageId), /Unknown worker request/);
+    await jobs.refresh(); assert.equal(jobs.status(request.requestId).messages[0].state, "rejected");
+    const beforeRetry = fs.readFileSync(calls, "utf8");
+    await assert.rejects(jobs.message(request.requestId, "Proceed", undefined, messageId), /Unknown worker request/);
+    assert.equal(fs.readFileSync(calls, "utf8"), beforeRetry, "A proven rejected instruction is not sent again");
+    if (control === "stop") await worker.abort(request.requestId);
+    else if (control === "cancel") await worker.cancelSaved("test");
+    else {
+      await jobs.close("quit"); store.release(); store = await openWorkerStorage(directory, identity); worker = await DurableWorker.open({ ...options, storage: store.storage });
+      jobs = new DurableJobs(root, "test", worker, { changed() {}, notify() {}, release() {} });
+    }
+    const result = await worker.inspect(request.requestId);
+    {
+      const outcome: any = result.task!.state;
+      assert.equal(outcome.outcome.result.status, "rejected");
+      assert.equal(outcome.outcome.result.previousFailure, "Historical unclassified controller rejection");
+      const replaced = result.taskId, before = fs.readFileSync(calls, "utf8");
+      await worker.abort(request.requestId); await worker.cancelSaved("test");
+      assert.equal((await worker.admission(request.requestId)).taskId, replaced);
+      assert.equal(fs.readFileSync(calls, "utf8"), before, "Closed pre-admission rejection cannot allocate another cancellation controller");
+    }
+    assert.equal(model.count(), 0);
+  } finally { await jobs.close("suspend"); store.release(); await new Promise<void>(resolve => server.close(() => resolve())); await remote.close("suspend"); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const equality of [true, false]) for (const control of ["resume", "stop", "cancel", "quit"] as const) test(`saved verified remote outcome ${equality ? "equals" : "replaces"} the local outcome under ${control} without transport`, async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pd-adopt-verified-")));
+  const identity = { ...workspace, cwd: root }, remoteIdentity = { ...identity, identity: randomUUID() };
+  const transport = path.join(root, "transport.py"), calls = path.join(root, "calls.jsonl");
+  fs.writeFileSync(transport, `import pathlib\npathlib.Path(${JSON.stringify(calls)}).write_text('unexpected transport')\nraise RuntimeError('Original worker is offline')\n`);
+  const target = { workspace: remoteIdentity, transport: ["python3", transport] };
+  const request = { ...input(), workspace: identity, lifetime: "session" as const, placement: target };
+  const remoteInput = { ...request, workspace: remoteIdentity }; delete (remoteInput as any).placement;
+  const model = models(), directory = path.join(root, "store");
+  const options = { workspace: identity, models: model.models, tools: [], env: () => undefined, resume: false };
+  let store = await openWorkerStorage(directory, identity), worker = await DurableWorker.open({ ...options, storage: store.storage });
+  const verified = { status: "completed", result: { status: "complete", text: "Verified original-worker result" } } as const;
+  let originalId = 0;
+  try {
+    const conversation = await worker.harness.root(BACKGROUND_CONTEXT);
+    originalId = await worker.harness.commit(tx => tx.createTask(RemoteTask, { root, target, submission: remoteInput, observe: true }, { ownership: { kind: "conversation" }, conversationId: conversation.id }), BACKGROUND_CONTEXT);
+    await worker.harness.commit(async tx => {
+      const original = (await tx.task(originalId as any))!;
+      (tx as any).setTask({ ...original, state: { status: "terminal", outcome: equality ? verified : { status: "faulted", error: { message: "Local observer fault after saving the remote receipt" } } }, endedAt: Date.now() });
+      await persistAdmission(tx, request.requestId, { taskId: originalId, fingerprint: (await import("../src/config.ts")).digest(request), input: request });
+      (await tx.doc(RemoteSnapshots)).requests[request.requestId] = { fingerprint: (await import("../src/config.ts")).digest(remoteInput), taskId: 99, task: { id: 99, state: { status: "terminal", outcome: verified } }, children: [], messages: [], attention: [] };
+    }, BACKGROUND_CONTEXT);
+    await worker.close("suspend"); store.release(); store = await openWorkerStorage(directory, identity); worker = await DurableWorker.open({ ...options, storage: store.storage });
+    if (control === "resume") { await worker.resumeSaved(); await worker.wait(request.requestId); }
+    else if (control === "stop") await worker.abort(request.requestId);
+    else if (control === "cancel") await worker.cancelSaved("test");
+    else { await worker.close("cancel-session", "test"); store.release(); store = await openWorkerStorage(directory, identity); worker = await DurableWorker.open({ ...options, storage: store.storage }); }
+    const adopted = await worker.inspect(request.requestId);
+    assert.deepEqual((adopted.task!.state as any).outcome, verified);
+    assert.equal(adopted.taskId === originalId, equality, "Only mismatched local outcomes need an adoption controller");
+    assert.equal(fs.existsSync(calls), false, "A retained terminal receipt needs no submit, inspect or abort transport");
+    assert.equal(model.count(), 0);
+  } finally { await worker.close("suspend"); store.release(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 for (const failure of ["failed", "faulted"] as const) for (const control of ["stop", "cancel", "quit"] as const) test(`verified remote ${failure} outcome is preserved under ${control}`, { timeout: 15000 }, async () => {
@@ -1525,6 +1712,7 @@ for (const cancel of [false, true]) test(`stages queued behind this worker capac
     let next = second;
     if (cancel) {
       await worker.abort(second.requestId);
+      assert.equal(((await worker.inspect(second.requestId)).task!.state as any).outcome.status, "aborted", "Cancelling a capacity waiter records an actual abort");
       assert.notEqual((await worker.inspect(first.requestId)).task!.state.status, "terminal", "Cancelling the waiter cannot abort the capacity owner");
       next = { ...input(), workspace: identity }; await jobs.submit(next);
     }
@@ -1615,6 +1803,7 @@ test("queued stages use a freed reservation while another stage remains busy", {
     const requests = ["one", "two", "three"].map(name => { const r: any = { ...input(), workspace: identity }; r.stage = { ...r.stage, task: name === "three" ? "Finish" : `Hold ${name}`, tools: ["hold"] }; return r; });
     await worker.submit(requests[0]); await worker.submit(requests[1]); await eventually(async () => entered.size === 2);
     await worker.submit(requests[2]); await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(((await worker.inspect(requests[2].requestId)).task!.state as any).checkpoint?.phase, "queued", "The third stage first waits for capacity");
     release.get("one")!(); await worker.wait(requests[0].requestId);
     await eventually(async () => (await worker.inspect(requests[2].requestId)).task!.state.status === "terminal", 3000);
     assert.equal(((await worker.inspect(requests[2].requestId)).task!.state as any).outcome.result.status, "complete");
@@ -1667,5 +1856,6 @@ test("queued stage admissions still enforce the owner's launch guideline", { tim
     const outcome: any = (await worker.inspect(excess.requestId)).task!.state;
     assert.equal(outcome.outcome.status, "faulted"); assert.match(outcome.outcome.error.message, /launch guideline|launch budget/);
     assert.equal(model.count(), 1); release(); await worker.wait(first.requestId); await worker.wait(second.requestId);
+    assert.equal(((await worker.inspect(second.requestId)).task!.state as any).outcome.result.status, "complete", "A restored queued stage finishes within the owner's launch guideline");
   } finally { release(); await worker.close("suspend"); }
 });

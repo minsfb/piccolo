@@ -40,6 +40,12 @@ Compatibility changes affect method wrappers in the current process, so restart
 Pi after changing them. Exact SDK-based regression checks do not establish live
 model, terminal, or deployment acceptance.
 
+The experimental `native-v1` selection requires the public
+`pi.completion-admission/v1` contract and the current session identity. Its Pi
+prototype is proposed upstream and has not been released. Queued or accepted
+notification admission does not mean the parent inspected the task outcome.
+See the [prototype and release gates](../../docs/native-turn-admission.md).
+
 `pi-harness-health:inspect:v1` supplies validated configuration, categorical
 observations, and deadline expectations. `pi-harness-health:attention-owner:v1`
 claims parent attention only when active, recording, and capable of safe wake.
